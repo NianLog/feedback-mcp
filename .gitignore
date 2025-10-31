@@ -44,13 +44,13 @@ coverage/
 tmp/
 temp/
 
-# Documentation (keep only README.md and README_EN.md)
+# Documentation (keep only README.md, README_EN.md and assets/)
 CHANGELOG.md
-assets/
 docs/
 *.md
 !README.md
 !README_EN.md
+!assets/
 
 # Package managers
 package-lock.json
