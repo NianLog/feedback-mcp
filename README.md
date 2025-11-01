@@ -1,4 +1,4 @@
-# feedback-mcp-server
+# feedback-mcp-server v1.1.2
 
 一个轻量级的 MCP (Model Context Protocol) 服务器，提供基于浏览器的交互式用户反馈功能，支持完整的 Markdown 渲染和语法高亮。
 

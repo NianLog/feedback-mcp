@@ -1,4 +1,4 @@
-# feedback-mcp-server
+# feedback-mcp-server v1.1.2
 
 A lightweight MCP (Model Context Protocol) server that provides interactive user feedback functionality through browser dialogs with complete Markdown rendering and syntax highlighting.
 
