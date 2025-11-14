@@ -67,7 +67,8 @@ function generateHTML(message: string, timeout: number, language: string): strin
     themeToggle: '🌙️',
     timeoutMessage: 'Timeout! Window will auto close...',
     submitSuccess: 'Submitted! Window will auto close...',
-    cancelMessage: 'Cancelled! Window will auto close...'
+    cancelMessage: 'Cancelled! Window will auto close...',
+    shortcutsHint: '💡 Shortcuts: Ctrl+Enter to submit, Esc to cancel'
   } : {
     title: '🤖 AI 交互式反馈',
     description: '请查看以下信息并提供您的反馈',
@@ -82,7 +83,8 @@ function generateHTML(message: string, timeout: number, language: string): strin
     themeToggle: '🌙️',
     timeoutMessage: '⏰ 超时！窗口将自动关闭...',
     submitSuccess: '✅ 已提交，窗口将自动关闭...',
-    cancelMessage: '❌ 已取消，窗口将自动关闭...'
+    cancelMessage: '❌ 已取消，窗口将自动关闭...',
+    shortcutsHint: '💡 快捷键：Ctrl+Enter 提交，Esc 取消'
   };
 
   // 尝试渲染Markdown
@@ -300,6 +302,16 @@ function generateHTML(message: string, timeout: number, language: string): strin
       font-weight: 500;
     }
 
+    .shortcuts-hint {
+      text-align: center;
+      padding: 8px 16px;
+      background: #e3f2fd;
+      color: #1976d2;
+      font-size: 13px;
+      font-weight: 500;
+      border-bottom: 1px solid #dee2e6;
+    }
+
     @media (max-width: 600px) {
       .copy-buttons {
         flex-direction: column;
@@ -396,6 +408,12 @@ function generateHTML(message: string, timeout: number, language: string): strin
       color: #fbbf24;
     }
 
+    body.dark-theme .shortcuts-hint {
+      background: #1e3a8a;
+      color: #93c5fd;
+      border-bottom: 1px solid #4b5563;
+    }
+
     body.dark-theme .theme-toggle {
       background: rgba(255, 255, 255, 0.1);
       border-color: rgba(255, 255, 255, 0.2);
@@ -419,6 +437,10 @@ function generateHTML(message: string, timeout: number, language: string): strin
     </div>
 
     <div id="timer" class="timer"></div>
+
+    <div class="shortcuts-hint">
+      ${uiText.shortcutsHint}
+    </div>
 
     <div class="content" id="content">
       ${processedMessage}
@@ -495,8 +517,60 @@ function generateHTML(message: string, timeout: number, language: string): strin
       }
     }
 
-    // 页面加载时恢复主题
+    // 页面加载时恢复主题和窗口位置
     restoreTheme();
+    restoreWindowPosition();
+
+    // 保存窗口位置
+    function saveWindowPosition() {
+      try {
+        localStorage.setItem('feedback-mcp-window-pos', JSON.stringify({
+          left: window.screenX,
+          top: window.screenY,
+          width: window.outerWidth,
+          height: window.outerHeight
+        }));
+      } catch (e) {
+        // 忽略存储错误
+      }
+    }
+
+    // 恢复窗口位置（仅在支持App模式的浏览器中有效）
+    function restoreWindowPosition() {
+      try {
+        const saved = localStorage.getItem('feedback-mcp-window-pos');
+        if (saved) {
+          const pos = JSON.parse(saved);
+          // 对于App模式窗口，尝试移动到保存的位置
+          if (window.opener === null && window.top === window) {
+            // 检查是否在合理范围内
+            const isValidPosition =
+              pos.left >= 0 && pos.top >= 0 &&
+              pos.left < screen.width && pos.top < screen.height &&
+              pos.width > 100 && pos.height > 100;
+
+            if (isValidPosition) {
+              window.moveTo(pos.left, pos.top);
+            }
+          }
+        }
+      } catch (e) {
+        // 忽略恢复错误
+      }
+    }
+
+    // 监听窗口移动和大小变化
+    let saveTimeout;
+    function scheduleSave() {
+      clearTimeout(saveTimeout);
+      saveTimeout = setTimeout(saveWindowPosition, 500);
+    }
+
+    window.addEventListener('move', scheduleSave);
+    window.addEventListener('resize', scheduleSave);
+
+    // 页面关闭时保存
+    window.addEventListener('beforeunload', saveWindowPosition);
 
     // 复制为纯文本
     function copyAsPlainText() {
