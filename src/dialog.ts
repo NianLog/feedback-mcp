@@ -520,7 +520,7 @@ export async function showDialog(options: DialogOptions): Promise<DialogResult> 
       try {
         let browserOpened = false;
 
-        // 首先尝试找到Chrome或Edge的完整路径
+        // 首先尝试找到浏览器的完整路径
         const findBrowserPath = async (): Promise<string | null> => {
           const commonPaths = [];
 
@@ -530,28 +530,59 @@ export async function showDialog(options: DialogOptions): Promise<DialogResult> 
             const programFilesX86 = process.env['PROGRAMFILES(X86)'] || 'C:\\Program Files (x86)';
             const localAppData = process.env.LOCALAPPDATA || path.join(process.env.USERPROFILE || '', 'AppData', 'Local');
 
+            // Chrome
             commonPaths.push(
               path.join(programFiles, 'Google', 'Chrome', 'Application', 'chrome.exe'),
               path.join(programFilesX86, 'Google', 'Chrome', 'Application', 'chrome.exe'),
-              path.join(localAppData, 'Google', 'Chrome', 'Application', 'chrome.exe'),
+              path.join(localAppData, 'Google', 'Chrome', 'Application', 'chrome.exe')
+            );
+
+            // Edge
+            commonPaths.push(
               path.join(programFiles, 'Microsoft', 'Edge', 'Application', 'msedge.exe'),
               path.join(programFilesX86, 'Microsoft', 'Edge', 'Application', 'msedge.exe')
             );
-          } else if (process.platform === 'darwin') {
+
+            // Firefox
             commonPaths.push(
+              path.join(programFiles, 'Mozilla Firefox', 'firefox.exe'),
+              path.join(programFilesX86, 'Mozilla Firefox', 'firefox.exe'),
+              path.join(localAppData, 'Programs', 'Firefox', 'firefox.exe')
+            );
+
+          } else if (process.platform === 'darwin') {
+            // macOS常见浏览器路径
+            commonPaths.push(
+              // Chrome
               '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
-              '/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge'
+              // Edge
+              '/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge',
+              // Firefox
+              '/Applications/Firefox.app/Contents/MacOS/firefox',
+              '/Applications/Firefox Developer Edition.app/Contents/MacOS/firefox',
+              // Safari (不支持app模式，但可以作为备用)
+              '/Applications/Safari.app/Contents/MacOS/Safari'
             );
           } else {
+            // Linux常见浏览器路径
             commonPaths.push(
+              // Chrome/Chromium
               '/usr/bin/google-chrome',
               '/usr/bin/google-chrome-stable',
               '/usr/bin/chromium-browser',
-              '/usr/bin/microsoft-edge'
+              '/usr/bin/chromium',
+              '/snap/bin/chromium',
+              // Edge
+              '/usr/bin/microsoft-edge',
+              '/opt/microsoft/msedge/msedge',
+              // Firefox
+              '/usr/bin/firefox',
+              '/usr/bin/firefox-esr',
+              '/snap/bin/firefox'
             );
           }
 
-          // 检查哪个路径存在
+          // 检查哪个路径存在（优先Chrome/Edge，然后Firefox）
           for (const browserPath of commonPaths) {
             if (fs.existsSync(browserPath)) {
               console.error(`[feedback-mcp] Found browser at: ${browserPath}`);
@@ -562,11 +593,11 @@ export async function showDialog(options: DialogOptions): Promise<DialogResult> 
           // 尝试在PATH中查找
           try {
             if (process.platform === 'win32') {
-              const { stdout } = await execAsync('where chrome 2>nul || where msedge 2>nul || echo notfound');
+              const { stdout } = await execAsync('where chrome 2>nul || where msedge 2>nul || where firefox 2>nul || echo notfound');
               const path = stdout.trim();
               return path !== 'notfound' ? path : null;
             } else {
-              const { stdout } = await execAsync('which google-chrome 2>/dev/null || which msedge 2>/dev/null || echo notfound');
+              const { stdout } = await execAsync('which google-chrome 2>/dev/null || which msedge 2>/dev/null || which firefox 2>/dev/null || echo notfound');
               const path = stdout.trim();
               return path !== 'notfound' ? path : null;
             }
@@ -610,6 +641,50 @@ export async function showDialog(options: DialogOptions): Promise<DialogResult> 
           });
         };
 
+        // 启动普通模式（用于不支持app模式的浏览器）
+        const launchRegularMode = async (browserPath: string, browserName: string): Promise<boolean> => {
+          return new Promise((resolve) => {
+            // Safari和Firefox的普通模式参数
+            let args = [url];
+
+            if (browserName === 'Firefox') {
+              // Firefox特定参数
+              args = [
+                '--new-window',
+                '--width=900',
+                '--height=700',
+                url
+              ];
+            } else if (browserName === 'Safari') {
+              // Safari特定参数
+              args = [url];
+            }
+
+            console.error(`[feedback-mcp] Launching ${browserName} in regular mode with args:`, args);
+
+            const process = spawn(browserPath, args, {
+              detached: true,
+              stdio: 'ignore'
+            });
+
+            process.on('error', (err) => {
+              console.error(`[feedback-mcp] ${browserName} regular mode failed:`, err.message);
+              resolve(false);
+            });
+
+            process.on('spawn', () => {
+              console.error(`[feedback-mcp] ${browserName} regular mode launched successfully`);
+              process.unref();
+              resolve(true);
+            });
+
+            // 如果进程在3秒内没有spawn，认为失败
+            setTimeout(() => {
+              resolve(false);
+            }, 3000);
+          });
+        };
+
         // Windows最佳实践：优先使用start命令
         if (process.platform === 'win32') {
           try {
@@ -643,12 +718,23 @@ export async function showDialog(options: DialogOptions): Promise<DialogResult> 
 
             if (browserPath) {
               const isChrome = browserPath.toLowerCase().includes('chrome');
-              const browserName = isChrome ? 'Chrome' : 'Edge';
+              const isEdge = browserPath.toLowerCase().includes('edge');
+              const isFirefox = browserPath.toLowerCase().includes('firefox');
 
-              browserOpened = await launchAppMode(browserPath, browserName);
+              let browserName = 'Chrome';
+              if (isEdge) browserName = 'Edge';
+              else if (isFirefox) browserName = 'Firefox';
+
+              // Firefox不支持app模式，需要特殊处理
+              if (isFirefox) {
+                console.error('[feedback-mcp] Firefox detected, using regular window mode');
+                browserOpened = await launchRegularMode(browserPath, browserName);
+              } else {
+                browserOpened = await launchAppMode(browserPath, browserName);
+              }
 
               if (!browserOpened) {
-                console.error('[feedback-mcp] App mode failed, trying default browser');
+                console.error('[feedback-mcp] Browser launch failed, trying default browser');
               }
             }
           }
@@ -658,9 +744,22 @@ export async function showDialog(options: DialogOptions): Promise<DialogResult> 
 
           if (browserPath) {
             const isChrome = browserPath.toLowerCase().includes('chrome');
-            const browserName = isChrome ? 'Chrome' : 'Edge';
+            const isEdge = browserPath.toLowerCase().includes('edge');
+            const isFirefox = browserPath.toLowerCase().includes('firefox');
+            const isSafari = browserPath.toLowerCase().includes('safari');
 
-            browserOpened = await launchAppMode(browserPath, browserName);
+            let browserName = 'Chrome';
+            if (isEdge) browserName = 'Edge';
+            else if (isFirefox) browserName = 'Firefox';
+            else if (isSafari) browserName = 'Safari';
+
+            // Safari和Firefox不支持app模式，需要特殊处理
+            if (isFirefox || isSafari) {
+              console.error(`[feedback-mcp] ${browserName} detected, using regular window mode`);
+              browserOpened = await launchRegularMode(browserPath, browserName);
+            } else {
+              browserOpened = await launchAppMode(browserPath, browserName);
+            }
 
             if (!browserOpened) {
               console.error('[feedback-mcp] App mode failed, trying default browser');
