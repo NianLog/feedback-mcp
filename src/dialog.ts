@@ -68,7 +68,9 @@ function generateHTML(message: string, timeout: number, language: string): strin
     timeoutMessage: 'Timeout! Window will auto close...',
     submitSuccess: 'Submitted! Window will auto close...',
     cancelMessage: 'Cancelled! Window will auto close...',
-    shortcutsHint: '💡 Shortcuts: Ctrl+Enter to submit, Esc to cancel'
+    shortcutsHint: '💡 Shortcuts: Ctrl+Enter to submit, Esc to cancel',
+    errorMessage: '❌ Error occurred, please retry',
+    retryButton: '🔄 Retry'
   } : {
     title: '🤖 AI 交互式反馈',
     description: '请查看以下信息并提供您的反馈',
@@ -84,7 +86,9 @@ function generateHTML(message: string, timeout: number, language: string): strin
     timeoutMessage: '⏰ 超时！窗口将自动关闭...',
     submitSuccess: '✅ 已提交，窗口将自动关闭...',
     cancelMessage: '❌ 已取消，窗口将自动关闭...',
-    shortcutsHint: '💡 快捷键：Ctrl+Enter 提交，Esc 取消'
+    shortcutsHint: '💡 快捷键：Ctrl+Enter 提交，Esc 取消',
+    errorMessage: '❌ 发生错误，请重试',
+    retryButton: '🔄 重试'
   };
 
   // 尝试渲染Markdown
@@ -598,25 +602,92 @@ function generateHTML(message: string, timeout: number, language: string): strin
       }, 2000);
     }
 
-    // 提交响应
+    // 提交响应（带重试机制）
     function submitResponse() {
       const response = document.getElementById('response').value;
+      const submitBtn = document.querySelector('.btn-primary');
+      const originalText = submitBtn.textContent;
+
+      // 显示加载状态
+      submitBtn.textContent = '⏳ 提交中...';
+      submitBtn.disabled = true;
+
       fetch('/submit', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ response })
-      }).then(() => {
-        document.body.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;min-height:100vh;font-size:24px;color:white;">${uiText.submitSuccess}</div>';
-        setTimeout(() => window.close(), 1500);
+      }).then((res) => {
+        if (res.ok) {
+          document.body.innerHTML = \`<div style="display:flex;align-items:center;justify-content:center;min-height:100vh;font-size:24px;color:white;">\${uiText.submitSuccess}</div>\`;
+          setTimeout(() => window.close(), 1500);
+        } else {
+          throw new Error(\`HTTP \${res.status}\`);
+        }
+      }).catch((error) => {
+        console.error('[feedback-mcp] Submit error:', error);
+        submitBtn.textContent = originalText;
+        submitBtn.disabled = false;
+        showError(\`\${uiText.errorMessage} (\${error.message})\`);
       });
     }
 
-    // 取消
+    // 取消（带错误处理）
     function cancel() {
-      fetch('/cancel', { method: 'POST' }).then(() => {
-        document.body.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;min-height:100vh;font-size:24px;color:white;">${uiText.cancelMessage}</div>';
-        setTimeout(() => window.close(), 1500);
-      });
+      const cancelBtn = document.querySelector('.btn-secondary');
+      const originalText = cancelBtn.textContent;
+
+      cancelBtn.textContent = '⏳ 处理中...';
+      cancelBtn.disabled = true;
+
+      fetch('/cancel', { method: 'POST' })
+        .then((res) => {
+          if (res.ok) {
+            document.body.innerHTML = \`<div style="display:flex;align-items:center;justify-content:center;min-height:100vh;font-size:24px;color:white;">\${uiText.cancelMessage}</div>\`;
+            setTimeout(() => window.close(), 1500);
+          } else {
+            throw new Error(\`HTTP \${res.status}\`);
+          }
+        })
+        .catch((error) => {
+          console.error('[feedback-mcp] Cancel error:', error);
+          cancelBtn.textContent = originalText;
+          cancelBtn.disabled = false;
+          showError(\`\${uiText.errorMessage} (\${error.message})\`);
+        });
+    }
+
+    // 显示错误信息
+    function showError(message) {
+      const errorDiv = document.createElement('div');
+      errorDiv.style.cssText = \`
+        position: fixed;
+        top: 20px;
+        right: 20px;
+        background: #dc3545;
+        color: white;
+        padding: 12px 20px;
+        border-radius: 8px;
+        box-shadow: 0 4px 12px rgba(220, 53, 69, 0.3);
+        z-index: 10000;
+        max-width: 300px;
+        font-size: 14px;
+        font-weight: 500;
+      \`;
+      errorDiv.innerHTML = \`
+        <div style="display: flex; align-items: center; gap: 8px;">
+          <span>❌</span>
+          <span>\${message}</span>
+        </div>
+      \`;
+
+      document.body.appendChild(errorDiv);
+
+      // 3秒后自动移除
+      setTimeout(() => {
+        if (errorDiv.parentNode) {
+          errorDiv.parentNode.removeChild(errorDiv);
+        }
+      }, 3000);
     }
 
     // 快捷键支持
@@ -680,37 +751,85 @@ export async function showDialog(options: DialogOptions): Promise<DialogResult> 
       }
     }
 
-    // 创建HTTP服务器
+    // 创建HTTP服务器（增强错误处理）
     server = http.createServer((req, res) => {
-      // 处理提交
-      if (req.method === 'POST' && req.url === '/submit') {
-        let body = '';
-        req.on('data', chunk => { body += chunk; });
-        req.on('end', () => {
-          try {
-            const { response } = JSON.parse(body);
-            res.writeHead(200, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ success: true }));
-            resolveOnce({ submitted: true, response });
-          } catch (error) {
+      try {
+        // 处理提交
+        if (req.method === 'POST' && req.url === '/submit') {
+          let body = '';
+
+          req.on('error', (err) => {
+            console.error('[feedback-mcp] Request error:', err);
             res.writeHead(400, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ error: 'Invalid JSON' }));
-          }
-        });
-        return;
-      }
+            res.end(JSON.stringify({ error: 'Request error' }));
+            return;
+          });
 
-      // 处理取消
-      if (req.method === 'POST' && req.url === '/cancel') {
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ success: true }));
-        resolveOnce({ submitted: false });
-        return;
-      }
+          req.on('data', chunk => {
+            body += chunk;
 
-      // 返回HTML页面
-      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-      res.end(generateHTML(message, timeout, options.language));
+            // 防止过大的请求体
+            if (body.length > 1024 * 1024) { // 1MB限制
+              req.destroy();
+              res.writeHead(413, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ error: 'Request too large' }));
+              return;
+            }
+          });
+
+          req.on('end', () => {
+            try {
+              const { response } = JSON.parse(body);
+
+              // 验证响应内容
+              if (typeof response !== 'string') {
+                res.writeHead(400, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: 'Invalid response format' }));
+                return;
+              }
+
+              // 限制响应长度
+              if (response.length > 10000) {
+                res.writeHead(400, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: 'Response too long' }));
+                return;
+              }
+
+              res.writeHead(200, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ success: true }));
+              resolveOnce({ submitted: true, response });
+            } catch (error) {
+              console.error('[feedback-mcp] Submit JSON parse error:', error);
+              res.writeHead(400, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ error: 'Invalid JSON format' }));
+            }
+          });
+          return;
+        }
+
+        // 处理取消
+        if (req.method === 'POST' && req.url === '/cancel') {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ success: true }));
+          resolveOnce({ submitted: false });
+          return;
+        }
+
+        // 处理404
+        if (req.url !== '/') {
+          res.writeHead(404, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Not found' }));
+          return;
+        }
+
+        // 返回HTML页面
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end(generateHTML(message, timeout, options.language));
+      } catch (error) {
+        console.error('[feedback-mcp] Server error:', error);
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Internal server error' }));
+      }
     });
 
     // 监听随机端口
