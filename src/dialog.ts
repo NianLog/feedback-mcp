@@ -64,6 +64,7 @@ function generateHTML(message: string, timeout: number, language: string): strin
     inputPlaceholder: 'Please enter your response here...',
     submit: 'Submit',
     cancel: 'Cancel',
+    themeToggle: '🌙️',
     timeoutMessage: 'Timeout! Window will auto close...',
     submitSuccess: 'Submitted! Window will auto close...',
     cancelMessage: 'Cancelled! Window will auto close...'
@@ -78,6 +79,7 @@ function generateHTML(message: string, timeout: number, language: string): strin
     inputPlaceholder: '请在此输入您的回复...',
     submit: '✅ 提交',
     cancel: '❌ 取消',
+    themeToggle: '🌙️',
     timeoutMessage: '⏰ 超时！窗口将自动关闭...',
     submitSuccess: '✅ 已提交，窗口将自动关闭...',
     cancelMessage: '❌ 已取消，窗口将自动关闭...'
@@ -307,10 +309,110 @@ function generateHTML(message: string, timeout: number, language: string): strin
         flex-direction: column;
       }
     }
+
+    /* 主题切换按钮 */
+    .theme-toggle {
+      position: absolute;
+      top: 12px;
+      right: 12px;
+      background: rgba(255, 255, 255, 0.2);
+      border: 1px solid rgba(255, 255, 255, 0.3);
+      border-radius: 20px;
+      padding: 8px 12px;
+      cursor: pointer;
+      font-size: 14px;
+      transition: all 0.2s;
+      z-index: 1000;
+    }
+
+    .theme-toggle:hover {
+      background: rgba(255, 255, 255, 0.3);
+      transform: scale(1.1);
+    }
+
+    /* 暗色主题 */
+    body.dark-theme {
+      background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+    }
+
+    body.dark-theme .container {
+      background: #1e1e2e;
+      color: #ffffff;
+    }
+
+    body.dark-theme .header {
+      background: linear-gradient(135deg, #2d3748 0%, #4a5568 100%);
+    }
+
+    body.dark-theme .content {
+      background: #2d3748;
+      color: #e2e8f0;
+    }
+
+    body.dark-theme .copy-buttons {
+      background: #374151;
+      border-top: 1px solid #4b5563;
+    }
+
+    body.dark-theme .copy-btn {
+      background: #4b5563;
+      color: #e2e8f0;
+      border-color: #6b7280;
+    }
+
+    body.dark-theme .copy-btn:hover {
+      background: #6b7280;
+      border-color: #9ca3af;
+    }
+
+    body.dark-theme .input-section {
+      border-top: 1px solid #4b5563;
+    }
+
+    body.dark-theme .input-section label {
+      color: #e2e8f0;
+    }
+
+    body.dark-theme .input-section textarea {
+      background: #374151;
+      border-color: #4b5563;
+      color: #e2e8f0;
+    }
+
+    body.dark-theme .input-section textarea:focus {
+      border-color: #667eea;
+    }
+
+    body.dark-theme .btn-secondary {
+      background: #4b5563;
+    }
+
+    body.dark-theme .btn-secondary:hover {
+      background: #6b7280;
+    }
+
+    body.dark-theme .timer {
+      background: #374151;
+      color: #fbbf24;
+    }
+
+    body.dark-theme .theme-toggle {
+      background: rgba(255, 255, 255, 0.1);
+      border-color: rgba(255, 255, 255, 0.2);
+    }
+
+    body.dark-theme .theme-toggle:hover {
+      background: rgba(255, 255, 255, 0.2);
+    }
   </style>
 </head>
 <body>
   <div class="container">
+    <!-- 主题切换按钮 -->
+    <button class="theme-toggle" onclick="toggleTheme()" title="Toggle Theme">
+      ${uiText.themeToggle}
+    </button>
+
     <div class="header">
       <h1>${language === 'en' ? '🤖 AI Interactive Feedback' : '🤖 AI 交互式反馈'}</h1>
       <p>${uiText.description}</p>
@@ -361,6 +463,40 @@ function generateHTML(message: string, timeout: number, language: string): strin
     }
 
     updateTimer();
+
+    // 主题切换
+    function toggleTheme() {
+      const body = document.body;
+      const themeToggle = document.querySelector('.theme-toggle');
+
+      if (body.classList.contains('dark-theme')) {
+        body.classList.remove('dark-theme');
+        themeToggle.textContent = '🌙️';
+        // 保存主题偏好
+        localStorage.setItem('feedback-mcp-theme', 'light');
+      } else {
+        body.classList.add('dark-theme');
+        themeToggle.textContent = '☀️';
+        // 保存主题偏好
+        localStorage.setItem('feedback-mcp-theme', 'dark');
+      }
+    }
+
+    // 恢复主题偏好
+    function restoreTheme() {
+      const savedTheme = localStorage.getItem('feedback-mcp-theme');
+      const themeToggle = document.querySelector('.theme-toggle');
+
+      if (savedTheme === 'dark') {
+        document.body.classList.add('dark-theme');
+        themeToggle.textContent = '☀️';
+      } else {
+        themeToggle.textContent = '🌙️';
+      }
+    }
+
+    // 页面加载时恢复主题
+    restoreTheme();
 
     // 复制为纯文本
     function copyAsPlainText() {
