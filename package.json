@@ -5,7 +5,8 @@
   "main": "dist/index.js",
   "type": "module",
   "bin": {
-    "feedback-mcp": "./dist/index.js"
+    "feedback-mcp": "dist/index.js",
+    "feedback-mcp-server": "dist/index.js"
   },
   "scripts": {
     "build": "tsc",
@@ -18,7 +19,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/NianLog/feedback-mcp.git"
+    "url": "git+https://github.com/NianLog/feedback-mcp.git"
   },
   "homepage": "https://github.com/NianLog/feedback-mcp#readme",
   "bugs": {
