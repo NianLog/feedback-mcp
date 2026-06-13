@@ -14,7 +14,19 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
+import { readFileSync } from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { showDialog, type DialogOptions } from './dialog.js';
+
+/**
+ * 从 package.json 读取版本号，确保 MCP 握手上报的版本与发布版本一致。
+ * 路径基于当前模块位置（dist/index.js 或 src/index.ts）向上回到包根。
+ */
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const pkgVersion = JSON.parse(
+  readFileSync(path.join(__dirname, '..', 'package.json'), 'utf-8')
+).version as string;
 
 /**
  * 从环境变量或参数中获取配置
@@ -34,12 +46,22 @@ interface ServerConfig {
  * 配置优先级：环境变量 > 默认值
  */
 function parseConfig(): ServerConfig {
+  // 超时下界校验：避免 0/负数/非法值导致对话框刚开即超时（最小 5 秒，否则回退默认 5 分钟）
+  const minTimeout = 5000;
+  const parsedTimeout = parseInt(process.env.FEEDBACK_TIMEOUT || '300000', 10);
+  const defaultTimeout =
+    Number.isFinite(parsedTimeout) && parsedTimeout >= minTimeout ? parsedTimeout : 300000;
+
+  // 语言仅接受 'zh' | 'en'，非法值回退为 'zh'，避免任意字符串落入中文分支且 <html lang> 错误
+  const rawLang = process.env.FEEDBACK_LANGUAGE || 'zh';
+  const language = rawLang === 'en' || rawLang === 'zh' ? rawLang : 'zh';
+
   return {
-    defaultTimeout: parseInt(process.env.FEEDBACK_TIMEOUT || '300000', 10),
+    defaultTimeout,
     maxTokens: process.env.FEEDBACK_MAX_TOKENS
       ? parseInt(process.env.FEEDBACK_MAX_TOKENS, 10)
       : undefined,
-    language: process.env.FEEDBACK_LANGUAGE || 'zh',
+    language,
   };
 }
 
@@ -52,7 +74,7 @@ async function main() {
   // 创建MCP服务器实例
   const server = new McpServer({
     name: 'feedback-mcp',
-    version: '1.0.0',
+    version: pkgVersion,
   });
 
   console.error('[feedback-mcp] Server starting...');
