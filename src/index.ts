@@ -17,7 +17,7 @@ import { z } from 'zod';
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { showDialog, type DialogOptions } from './dialog.js';
+import { showDialog, type DialogOptions, type UIBackendType } from './dialog.js';
 
 /**
  * 从 package.json 读取版本号，确保 MCP 握手上报的版本与发布版本一致。
@@ -38,6 +38,8 @@ interface ServerConfig {
   maxTokens?: number;
   /** 界面语言 ('zh' | 'en') */
   language: string;
+  /** UI 后端：browser（默认，富文本）/ native（系统对话框，省内存）/ auto */
+  ui: UIBackendType;
 }
 
 /**
@@ -56,8 +58,13 @@ function parseConfig(): ServerConfig {
   const rawLang = process.env.FEEDBACK_LANGUAGE || 'zh';
   const language = rawLang === 'en' || rawLang === 'zh' ? rawLang : 'zh';
 
+  // UI 后端：browser（默认，富文本）/ native（系统对话框，省内存）/ auto（优先 native，不可用回退 browser）
+  const rawUi = process.env.FEEDBACK_UI || 'browser';
+  const ui: UIBackendType = rawUi === 'auto' || rawUi === 'native' ? rawUi : 'browser';
+
   return {
     defaultTimeout,
+    ui,
     maxTokens: process.env.FEEDBACK_MAX_TOKENS
       ? parseInt(process.env.FEEDBACK_MAX_TOKENS, 10)
       : undefined,
@@ -118,6 +125,7 @@ async function main() {
         timeout: config.defaultTimeout,
         maxTokens: config.maxTokens,
         language: config.language,
+        ui: config.ui,
       };
 
       // 显示对话框并等待响应

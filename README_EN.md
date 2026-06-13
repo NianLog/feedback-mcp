@@ -1,4 +1,4 @@
-# feedback-mcp-server v1.2.0
+# feedback-mcp-server v2.0.0
 
 A lightweight MCP (Model Context Protocol) server that provides interactive user feedback functionality through browser dialogs with complete Markdown rendering and syntax highlighting.
 
@@ -19,6 +19,7 @@ A lightweight MCP (Model Context Protocol) server that provides interactive user
 - ✅ **Lightweight Browser Window**: Chrome/Edge App mode, no address bar, low resource usage
 - ✅ **Markdown Rendering**: Complete Markdown support with syntax highlighting
 - ✅ **Fully Offline**: Prism syntax highlighting bundled locally; works without network or CDN
+- ✅ **Pluggable UI Backend**: rich-text browser by default; set `FEEDBACK_UI=native` to use the system native dialog (~10MB RAM, plain text)
 - ✅ **Security Hardening**: HTML sanitization (sanitize-html) against XSS, CSP security headers, listens only on localhost
 - ✅ **Smart Copy**: Support for copying as plain text or Markdown format
 - ✅ **Multi-language Interface**: Switch between Chinese and English interfaces
@@ -80,6 +81,7 @@ Configuration:
 | `FEEDBACK_TIMEOUT` | Timeout in milliseconds (min 5000, falls back to default if lower) | 300000 (5 min) |
 | `FEEDBACK_MAX_TOKENS` | Maximum output tokens | Unlimited |
 | `FEEDBACK_LANGUAGE` | Interface language (only `zh` / `en`; invalid values fall back to `zh`) | zh |
+| `FEEDBACK_UI` | UI backend (optional): `browser` (rich text) / `native` (system dialog, ~10MB) / `auto` (prefer native, fall back to browser) | browser |
 
 **Recommended Configuration:**
 ```json
@@ -160,6 +162,13 @@ AI automatically calls the `interactive_feedback` tool, and the browser opens a 
 - Check network connection and firewall settings
 
 ## 📋 Changelog
+
+### v2.0.0
+- 🏗️ **Pluggable UI backend architecture**: split `dialog.ts` into `core/` (types, markdown, html-template) + `backends/` (browser-backend, native-backend) behind a unified `UIBackend` interface
+- ⚡ **Native backend (low memory)**: new `FEEDBACK_UI=native` invokes the system native dialog (Linux zenity / macOS osascript / Windows PowerShell WinForms), cutting memory from ~300MB to ~10MB
+- 📝 **Markdown flattening**: the native backend auto-converts Markdown to readable plain text (no rich-text rendering)
+- 🔧 **Config**: new `FEEDBACK_UI` env var (optional, defaults to `browser`, fully backward compatible)
+- 📦 **Assets**: Windows native script `assets/native/win-feedback.ps1` bundled
 
 ### v1.2.0
 - 🎨 **UI Redesign**: Removed blue-purple gradients and emojis; adopted a graphite-minimal style (neutral gray + green accent); dark theme switched to neutral graphite
