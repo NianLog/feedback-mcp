@@ -35,14 +35,6 @@ function commandExists(cmd: string): Promise<boolean> {
   });
 }
 
-/** 截断 message（避免超长文本撑爆 native 对话框） */
-function truncateForNative(message: string, maxTokens?: number): string {
-  if (!maxTokens) return message;
-  const maxChars = maxTokens * 4;
-  return message.length > maxChars
-    ? message.slice(0, maxChars) + '\n\n[... 内容已截断 ...]'
-    : message;
-}
 
 /**
  * Linux：zenity 多行可编辑文本对话框。
@@ -177,7 +169,7 @@ export class NativeBackend implements UIBackend {
   async show(options: DialogOptions): Promise<DialogResult> {
     const timeoutMs = options.timeout || 300000;
     const timeoutSec = Math.max(5, Math.floor(timeoutMs / 1000));
-    const message = truncateForNative(markdownToPlain(options.message), options.maxTokens);
+    const message = markdownToPlain(options.message);
 
     try {
       if (process.platform === 'linux') return await showZenity(message, timeoutMs);

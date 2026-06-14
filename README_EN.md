@@ -1,4 +1,4 @@
-# feedback-mcp-server v2.0.0
+# feedback-mcp-server v2.1.0
 
 A lightweight MCP (Model Context Protocol) server that provides interactive user feedback functionality through browser dialogs with complete Markdown rendering and syntax highlighting.
 
@@ -40,9 +40,9 @@ No installation required, use directly in Claude Desktop:
       "command": "npx",
       "args": ["-y", "feedback-mcp-server@latest"],
       "env": {
-        "FEEDBACK_TIMEOUT": "300000",
-        "FEEDBACK_MAX_TOKENS": "2000",
-        "FEEDBACK_LANGUAGE": "en"
+        "FEEDBACK_TIMEOUT": "300",
+        "FEEDBACK_LANGUAGE": "en",
+        "FEEDBACK_THEME": "auto"
       }
     }
   }
@@ -63,9 +63,9 @@ Configuration:
     "feedback": {
       "command": "feedback-mcp-server",
       "env": {
-        "FEEDBACK_TIMEOUT": "300000",
-        "FEEDBACK_MAX_TOKENS": "2000",
-        "FEEDBACK_LANGUAGE": "en"
+        "FEEDBACK_TIMEOUT": "300",
+        "FEEDBACK_LANGUAGE": "en",
+        "FEEDBACK_THEME": "auto"
       }
     }
   }
@@ -78,18 +78,18 @@ Configuration:
 
 | Environment Variable | Description | Default |
 |---------------------|-------------|---------|
-| `FEEDBACK_TIMEOUT` | Timeout in milliseconds (min 5000, falls back to default if lower) | 300000 (5 min) |
-| `FEEDBACK_MAX_TOKENS` | Maximum output tokens | Unlimited |
+| `FEEDBACK_TIMEOUT` | Dialog timeout in seconds (min 5, falls back to 300 if invalid) | 300 (5 min) |
 | `FEEDBACK_LANGUAGE` | Interface language (only `zh` / `en`; invalid values fall back to `zh`) | zh |
 | `FEEDBACK_UI` | UI backend (optional): `browser` (rich text) / `native` (system dialog, ~10MB) / `auto` (prefer native, fall back to browser) | browser |
+| `FEEDBACK_THEME` | Theme (optional): `auto` (follow system) / `light` / `dark`; manual toggle is remembered | auto |
 
 **Recommended Configuration:**
 ```json
 {
   "env": {
-    "FEEDBACK_TIMEOUT": "300000",
-    "FEEDBACK_MAX_TOKENS": "2000",
-    "FEEDBACK_LANGUAGE": "en"
+    "FEEDBACK_TIMEOUT": "300",
+    "FEEDBACK_LANGUAGE": "en",
+    "FEEDBACK_THEME": "auto"
   }
 }
 ```
@@ -162,6 +162,13 @@ AI automatically calls the `interactive_feedback` tool, and the browser opens a 
 - Check network connection and firewall settings
 
 ## 📋 Changelog
+
+### v2.1.0
+- 🐛 **Fixed browser submit with large text**: removed the 10000-char response length cap (kept 1MB abuse limit) — submitting 5-10KB logs no longer fails with HTTP 400
+- ⏱️ **FEEDBACK_TIMEOUT now in seconds**: default 300s (5 min), more intuitive (was milliseconds)
+- 🗑️ **Removed FEEDBACK_MAX_TOKENS**: hard input truncation hurt normal usage; AI now controls message length via tool description
+- 🎨 **Theme follows system**: added `FEEDBACK_THEME` (`auto` default follows system / `light` / `dark`); manual toggle still remembered
+- 🔧 **Leaner tool description**: reduced token usage
 
 ### v2.0.0
 - 🏗️ **Pluggable UI backend architecture**: split `dialog.ts` into `core/` (types, markdown, html-template) + `backends/` (browser-backend, native-backend) behind a unified `UIBackend` interface

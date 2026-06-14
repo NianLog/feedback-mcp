@@ -102,15 +102,8 @@ export class BrowserBackend implements UIBackend {
         }
       };
 
-      // 处理消息截断
-      let message = options.message;
-      if (options.maxTokens) {
-        // 粗略估算：1 token ≈ 4 字符
-        const maxChars = options.maxTokens * 4;
-        if (message.length > maxChars) {
-          message = message.slice(0, maxChars) + '\n\n[... 内容已截断 ...]';
-        }
-      }
+      // 不再截断消息：交给 AI 通过工具描述控制 message 长度，避免误伤正常的长日志/代码
+      const message = options.message;
 
       // 创建HTTP服务器（增强错误处理）
       server = http.createServer((req, res) => {
@@ -159,12 +152,7 @@ export class BrowserBackend implements UIBackend {
                   return;
                 }
 
-                // 限制响应长度
-                if (response.length > 10000) {
-                  safeJson(400, { error: 'Response too long' });
-                  return;
-                }
-
+                // 不再限制响应长度：用户可能提交大段日志/代码，由 body 1MB 上限兜底防滥用即可
                 safeJson(200, { success: true });
                 resolveOnce({ submitted: true, response });
               } catch (error) {
@@ -209,7 +197,7 @@ export class BrowserBackend implements UIBackend {
               'X-Content-Type-Options': 'nosniff',
               'Referrer-Policy': 'no-referrer',
             });
-            res.end(generateHTML(message, timeout, options.language));
+            res.end(generateHTML(message, timeout, options.language, options.theme));
           }
         } catch (error) {
           console.error('[feedback-mcp] Server error:', error);

@@ -8,18 +8,21 @@
 /** UI 后端类型（由 FEEDBACK_UI 环境变量控制） */
 export type UIBackendType = 'auto' | 'browser' | 'native';
 
+/** 主题模式：auto 跟随系统 / light / dark */
+export type ThemeMode = 'auto' | 'light' | 'dark';
+
 /** 对话框配置选项 */
 export interface DialogOptions {
   /** 消息内容（支持 Markdown 格式） */
   message: string;
   /** 超时时间（毫秒），默认 300000ms（5 分钟） */
   timeout?: number;
-  /** 最大输出 token 数，超出则截断 */
-  maxTokens?: number;
   /** 界面语言（'zh' | 'en'） */
   language: string;
   /** UI 后端选择，默认 browser（富文本）；native 为系统对话框（纯文本，省内存） */
   ui?: UIBackendType;
+  /** 主题模式，默认 auto（跟随系统 prefers-color-scheme） */
+  theme?: ThemeMode;
 }
 
 /** 对话框返回结果 */

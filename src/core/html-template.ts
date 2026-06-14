@@ -6,6 +6,7 @@
  */
 
 import { renderMarkdownSafe } from './markdown.js';
+import type { ThemeMode } from './types.js';
 
 /**
  * Content-Security-Policy 响应头。
@@ -32,9 +33,10 @@ export const CSP_HEADER =
  * @param message - Markdown 原文（将经 renderMarkdownSafe 净化）
  * @param timeout - 超时时间（毫秒）
  * @param language - 界面语言（'zh' | 'en'）
+ * @param theme - 主题模式（'auto' 跟随系统 / 'light' / 'dark'）
  * @returns 完整 HTML 页面字符串
  */
-export function generateHTML(message: string, timeout: number, language: string): string {
+export function generateHTML(message: string, timeout: number, language: string, theme: ThemeMode = 'auto'): string {
   const processedMessage = renderMarkdownSafe(message);
 
   // 根据语言选择UI文本
@@ -446,6 +448,8 @@ export function generateHTML(message: string, timeout: number, language: string)
   <script>
     const originalMarkdown = ${JSON.stringify(message)};
     let timeoutSeconds = ${Math.floor(timeout / 1000)};
+    // 主题模式（服务端注入）：auto 跟随系统 / light / dark
+    const themeMode = '${theme}';
     // 防重入状态：避免按钮与快捷键重复触发 submit/cancel
     let submitting = false;
     let cancelling = false;
@@ -477,33 +481,50 @@ export function generateHTML(message: string, timeout: number, language: string)
 
     updateTimer();
 
-    // 主题切换（按钮文字标识当前可切换到的主题）
-    function toggleTheme() {
-      const body = document.body;
+    // 应用主题（统一入口，同步切换按钮文字）
+    function applyTheme(isDark) {
       const themeToggle = document.querySelector('.theme-toggle');
-
-      if (body.classList.contains('dark-theme')) {
-        body.classList.remove('dark-theme');
-        themeToggle.textContent = '${uiText.themeToggleDark}';
-        localStorage.setItem('feedback-mcp-theme', 'light');
-      } else {
-        body.classList.add('dark-theme');
-        themeToggle.textContent = '${uiText.themeToggleLight}';
-        localStorage.setItem('feedback-mcp-theme', 'dark');
-      }
-    }
-
-    // 恢复主题偏好
-    function restoreTheme() {
-      const savedTheme = localStorage.getItem('feedback-mcp-theme');
-      const themeToggle = document.querySelector('.theme-toggle');
-
-      if (savedTheme === 'dark') {
+      if (isDark) {
         document.body.classList.add('dark-theme');
         themeToggle.textContent = '${uiText.themeToggleLight}';
       } else {
+        document.body.classList.remove('dark-theme');
         themeToggle.textContent = '${uiText.themeToggleDark}';
       }
+    }
+
+    // 系统是否深色模式
+    function resolveAutoDark() {
+      return window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+    }
+
+    // 主题切换（手动覆盖，记忆到 localStorage）
+    function toggleTheme() {
+      const isDark = document.body.classList.contains('dark-theme');
+      applyTheme(!isDark);
+      localStorage.setItem('feedback-mcp-theme', !isDark ? 'dark' : 'light');
+    }
+
+    // 恢复主题：用户手动偏好(localStorage) > themeMode 配置 > 系统跟随(auto)
+    function restoreTheme() {
+      const savedTheme = localStorage.getItem('feedback-mcp-theme');
+      if (savedTheme === 'dark') { applyTheme(true); return; }
+      if (savedTheme === 'light') { applyTheme(false); return; }
+      if (themeMode === 'dark') applyTheme(true);
+      else if (themeMode === 'light') applyTheme(false);
+      else applyTheme(resolveAutoDark());
+    }
+
+    // auto 模式且用户未手动覆盖时，跟随系统主题变化
+    if (themeMode === 'auto') {
+      try {
+        const mql = window.matchMedia('(prefers-color-scheme: dark)');
+        if (mql.addEventListener) {
+          mql.addEventListener('change', () => {
+            if (!localStorage.getItem('feedback-mcp-theme')) applyTheme(resolveAutoDark());
+          });
+        }
+      } catch (e) { /* 忽略老浏览器 */ }
     }
 
     // 页面加载时恢复主题和窗口位置

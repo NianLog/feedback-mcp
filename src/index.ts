@@ -1,14 +1,12 @@
 #!/usr/bin/env node
 
 /**
- * @fileoverview 交互式反馈MCP服务器
+ * @fileoverview 交互式反馈 MCP 服务器
  *
- * 该MCP服务器提供交互式用户反馈功能，通过浏览器对话框收集用户输入。
- * 支持Markdown渲染、超时控制和配置管理。
+ * 提供交互式用户反馈功能，通过对话框收集用户输入。支持 Markdown 渲染、主题切换、
+ * 可选的浏览器/系统原生 UI 后端。
  *
- * 使用方式：
- * 1. 在Claude Desktop的配置文件中添加此MCP服务器
- * 2. AI可以调用interactive_feedback工具来获取用户的交互式反馈
+ * 使用方式：在 MCP 客户端（Claude Desktop / Cursor 等）配置中添加此服务器。
  */
 
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
@@ -18,6 +16,7 @@ import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { showDialog, type DialogOptions, type UIBackendType } from './dialog.js';
+import type { ThemeMode } from './core/types.js';
 
 /**
  * 从 package.json 读取版本号，确保 MCP 握手上报的版本与发布版本一致。
@@ -29,86 +28,82 @@ const pkgVersion = JSON.parse(
 ).version as string;
 
 /**
- * 从环境变量或参数中获取配置
+ * 服务器配置（从环境变量解析）
  */
 interface ServerConfig {
-  /** 默认超时时间（毫秒） */
+  /** 对话框超时（毫秒，由 FEEDBACK_TIMEOUT 秒换算） */
   defaultTimeout: number;
-  /** 最大输出token数 */
-  maxTokens?: number;
-  /** 界面语言 ('zh' | 'en') */
+  /** 界面语言（'zh' | 'en'） */
   language: string;
   /** UI 后端：browser（默认，富文本）/ native（系统对话框，省内存）/ auto */
   ui: UIBackendType;
+  /** 主题：auto（跟随系统）/ light / dark */
+  theme: ThemeMode;
 }
 
 /**
- * 解析服务器配置
+ * 解析服务器配置。
  *
- * 配置优先级：环境变量 > 默认值
+ * 设计原则：不再用环境变量强制截断用户输入（FEEDBACK_MAX_TOKENS 已移除）——
+ * 误伤正常的长日志/代码反而不利。token 控制交给 AI 协作（通过工具描述引导
+ * AI 主动精简 message），比硬截断更合理。
  */
 function parseConfig(): ServerConfig {
-  // 超时下界校验：避免 0/负数/非法值导致对话框刚开即超时（最小 5 秒，否则回退默认 5 分钟）
-  const minTimeout = 5000;
-  const parsedTimeout = parseInt(process.env.FEEDBACK_TIMEOUT || '300000', 10);
-  const defaultTimeout =
-    Number.isFinite(parsedTimeout) && parsedTimeout >= minTimeout ? parsedTimeout : 300000;
+  // 超时（秒）：FEEDBACK_TIMEOUT 以秒为单位，默认 300s（5 分钟），最小 5s，非法回退 300s
+  const rawTimeout = parseInt(process.env.FEEDBACK_TIMEOUT || '300', 10);
+  const timeoutSec = Number.isFinite(rawTimeout) && rawTimeout >= 5 ? rawTimeout : 300;
+  const defaultTimeout = timeoutSec * 1000;
 
-  // 语言仅接受 'zh' | 'en'，非法值回退为 'zh'，避免任意字符串落入中文分支且 <html lang> 错误
+  // 语言仅接受 'zh' | 'en'，非法值回退为 'zh'
   const rawLang = process.env.FEEDBACK_LANGUAGE || 'zh';
   const language = rawLang === 'en' || rawLang === 'zh' ? rawLang : 'zh';
 
-  // UI 后端：browser（默认，富文本）/ native（系统对话框，省内存）/ auto（优先 native，不可用回退 browser）
+  // UI 后端：browser（默认）/ native / auto
   const rawUi = process.env.FEEDBACK_UI || 'browser';
   const ui: UIBackendType = rawUi === 'auto' || rawUi === 'native' ? rawUi : 'browser';
 
-  return {
-    defaultTimeout,
-    ui,
-    maxTokens: process.env.FEEDBACK_MAX_TOKENS
-      ? parseInt(process.env.FEEDBACK_MAX_TOKENS, 10)
-      : undefined,
-    language,
-  };
+  // 主题：auto（默认，跟随系统）/ light / dark
+  const rawTheme = process.env.FEEDBACK_THEME || 'auto';
+  const theme: ThemeMode = rawTheme === 'light' || rawTheme === 'dark' ? rawTheme : 'auto';
+
+  return { defaultTimeout, language, ui, theme };
 }
 
 /**
- * 主函数 - 初始化并启动MCP服务器
+ * 主函数 - 初始化并启动 MCP 服务器
  */
 async function main() {
   const config = parseConfig();
 
-  // 创建MCP服务器实例
   const server = new McpServer({
     name: 'feedback-mcp',
     version: pkgVersion,
   });
 
   console.error('[feedback-mcp] Server starting...');
-  console.error(`[feedback-mcp] Default timeout: ${config.defaultTimeout}ms`);
+  console.error(`[feedback-mcp] Timeout: ${config.defaultTimeout / 1000}s`);
   console.error(`[feedback-mcp] Language: ${config.language}`);
-  if (config.maxTokens) {
-    console.error(`[feedback-mcp] Max tokens: ${config.maxTokens}`);
-  }
+  console.error(`[feedback-mcp] UI backend: ${config.ui}`);
+  console.error(`[feedback-mcp] Theme: ${config.theme}`);
 
   /**
-   * 注册interactive_feedback工具
+   * 注册 interactive_feedback 工具。
    *
-   * 该工具接收消息内容，通过浏览器对话框展示并等待用户响应。
-   * 支持Markdown格式内容，自动处理渲染失败的情况。
+   * 工具描述刻意精简（节约 token），并提示 AI 控制 message 长度——
+   * 这比用环境变量硬截断用户输入更合理（避免误伤正常的长日志/代码）。
    */
   server.registerTool(
     'interactive_feedback',
     {
       title: 'Interactive Feedback Dialog',
       description:
-        'Request interactive feedback from the user via a lightweight browser dialog. ' +
-        'Displays content with full Markdown support and syntax highlighting. ' +
-        'Timeout and token limits are configured via environment variables in MCP server settings.',
+        'Show a dialog to the user with your message and wait for their response. ' +
+        'Use this to ask questions, confirm decisions, or get input when blocked. ' +
+        'Keep the message concise and readable — the user reads it, so summarize rather than dumping raw logs.',
       inputSchema: {
         message: z
           .string()
-          .describe('The message to display to the user (supports Markdown format with syntax highlighting for code blocks)'),
+          .describe('Text to show the user (Markdown supported). Keep it focused and readable.'),
       },
       outputSchema: {
         submitted: z.boolean().describe('Whether the user submitted a response'),
@@ -119,16 +114,14 @@ async function main() {
     async ({ message }) => {
       console.error('[feedback-mcp] Tool called with message length:', message.length);
 
-      // 准备对话框选项（使用环境变量配置）
       const dialogOptions: DialogOptions = {
         message,
         timeout: config.defaultTimeout,
-        maxTokens: config.maxTokens,
         language: config.language,
         ui: config.ui,
+        theme: config.theme,
       };
 
-      // 显示对话框并等待响应
       const result = await showDialog(dialogOptions);
 
       console.error('[feedback-mcp] Dialog result:', {
@@ -137,14 +130,13 @@ async function main() {
         timedOut: result.timedOut,
       });
 
-      // 构造输出结果
       const output = {
         submitted: result.submitted,
         response: result.response || '',
         timedOut: result.timedOut || false,
       };
 
-      // 返回简洁的文本响应（节约token）
+      // 返回简洁的文本响应（节约 token）
       let textResponse: string;
       if (result.submitted && result.response) {
         textResponse = `User response: ${result.response}`;
@@ -155,21 +147,13 @@ async function main() {
       }
 
       return {
-        content: [
-          {
-            type: 'text',
-            text: textResponse,
-          },
-        ],
+        content: [{ type: 'text', text: textResponse }],
         structuredContent: output,
       };
     }
   );
 
-  // 创建标准输入/输出传输层
   const transport = new StdioServerTransport();
-
-  // 连接服务器到传输层
   await server.connect(transport);
 
   console.error('[feedback-mcp] Server started and connected via stdio');
