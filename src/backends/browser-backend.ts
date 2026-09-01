@@ -1,25 +1,73 @@
 /**
  * @fileoverview 浏览器后端：通过临时 HTTP 服务 + 系统浏览器展示富文本对话框。
  *
- * 这是 v1.x 的既有能力（Markdown 渲染、代码高亮、主题切换、超时），
  * v2.0 将其封装为 {@link BrowserBackend} 实现 {@link UIBackend} 接口。
  * 内存开销较高（浏览器进程 ~200-500MB），但支持完整富文本。
+ *
+ * v2.2 加固要点：
+ * - 仅绑定 127.0.0.1 回环 + Host 头校验（防 DNS rebinding 读取页面/令牌）；
+ * - 会话令牌保护 /submit /cancel /timeout（防本机其他网页 no-cors 跨站伪造）；
+ * - 请求体按 Buffer 收集（字符串拼接会在多字节字符跨界 chunk 时产生 U+FFFD）；
+ * - socket 全量跟踪，结束后统一销毁（server.close 不会关闭 keep-alive 连接）；
+ * - Prism 静态资源带路径遍历防护与内存缓存；
+ * - 结束后延迟关停：页面尚未加载过的（浏览器冷启动慢/脚本方秒速提交）等首次加载，
+ *   改送"会话已结束"收尾页让晚到窗口自行关闭，避免停在连接拒绝错误页。
  */
 
 import http from 'node:http';
-import open from 'open';
-import { spawn, exec } from 'node:child_process';
-import { promisify } from 'node:util';
+import type { Socket } from 'node:net';
+import { randomBytes } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { generateHTML, CSP_HEADER } from '../core/html-template.js';
-import type { UIBackend, DialogOptions, DialogResult } from '../core/types.js';
-
-const execAsync = promisify(exec);
+import { generateHTML, generateFinalHTML, CSP_HEADER } from '../core/html-template.js';
+import type { DialogOptions, DialogResult, UIBackend } from '../core/types.js';
+import { launchBrowserForUrl } from './browser-launch.js';
 
 /** 当前模块所在目录（定位包内 assets/prism） */
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+/** Prism 资源根目录 */
+const PRISM_ROOT = path.resolve(__dirname, '..', '..', 'assets', 'prism');
+
+/** 请求体上限（字节） */
+const MAX_BODY_BYTES = 1024 * 1024;
+
+/** Node setTimeout 参数上限（2^31-1ms，超出会立即触发） */
+const MAX_TIMER_MS = 2 ** 31 - 1;
+
+/** 结束后给响应留出的冲刷时间，随后强制销毁残余 socket */
+const SOCKET_DRAIN_MS = 500;
+
+/** Prism 资源内存缓存条目上限（文件小且有限，超出则清空重建） */
+const PRISM_CACHE_MAX = 64;
+
+/** 对话框结束后、页面已加载过时的默认延迟关停时长（等在途请求/响应收尾） */
+const POST_RESOLVE_TEARDOWN_MS = 2000;
+
+/**
+ * 对话框结束后、页面从未加载过时的最长等待（浏览器冷启动可能很慢）。
+ *
+ * 覆盖"脚本方秒速提交/超时，浏览器窗口数秒后才发起首次加载"的场景：
+ * 等到首次加载时改送收尾页让窗口自行关闭，而不是停在连接被拒错误页。
+ */
+const POST_RESOLVE_MAX_WAIT_MS = 30_000;
+
+/** Prism 文件缓存 */
+const prismCache = new Map<string, Buffer>();
+
+/** 扩展名 → Content-Type */
+function prismMime(ext: string): string {
+  if (ext === '.js') return 'text/javascript; charset=utf-8';
+  if (ext === '.css') return 'text/css; charset=utf-8';
+  return 'application/octet-stream';
+}
+
+/** 目标路径是否位于 root 目录内（防路径遍历） */
+function isWithin(root: string, target: string): boolean {
+  const rel = path.relative(root, target);
+  return rel === '' || (!rel.startsWith(`..${path.sep}`) && rel !== '..' && !path.isAbsolute(rel));
+}
 
 /**
  * 提供本地化的 Prism 静态资源（代码高亮）。
@@ -30,37 +78,70 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
  * @param res - HTTP 响应对象
  */
 function servePrismAsset(reqUrl: string, res: http.ServerResponse): void {
-  const prismRoot = path.join(__dirname, '..', '..', 'assets', 'prism');
-  const relPath = decodeURIComponent(reqUrl.slice('/prism/'.length).split('?')[0]);
+  const prefixed = reqUrl.slice('/prism/'.length).split('?')[0];
 
-  // 路径遍历防护：禁止 .. 与绝对路径
-  if (!relPath || relPath.includes('..') || path.isAbsolute(relPath)) {
+  let relPath: string;
+  try {
+    relPath = decodeURIComponent(prefixed);
+  } catch {
+    res.writeHead(400, { 'Content-Type': 'text/plain' });
+    res.end('Bad request');
+    return;
+  }
+
+  // 路径遍历防护：禁止 ..、绝对路径与 NUL
+  if (!relPath || relPath.includes('..') || path.isAbsolute(relPath) || relPath.includes('\0')) {
     res.writeHead(403, { 'Content-Type': 'text/plain' });
     res.end('Forbidden');
     return;
   }
 
-  const filePath = path.join(prismRoot, relPath);
-  if (!filePath.startsWith(prismRoot) || !fs.existsSync(filePath) || fs.statSync(filePath).isDirectory()) {
-    res.writeHead(404, { 'Content-Type': 'text/plain' });
-    res.end('Not found');
+  const filePath = path.resolve(PRISM_ROOT, relPath);
+  if (!isWithin(PRISM_ROOT, filePath)) {
+    res.writeHead(403, { 'Content-Type': 'text/plain' });
+    res.end('Forbidden');
     return;
   }
 
-  const ext = path.extname(filePath).toLowerCase();
-  const mime =
-    ext === '.js' ? 'text/javascript; charset=utf-8' :
-    ext === '.css' ? 'text/css; charset=utf-8' :
-    'application/octet-stream';
-
   try {
-    const data = fs.readFileSync(filePath);
-    res.writeHead(200, { 'Content-Type': mime, 'Cache-Control': 'public, max-age=86400' });
+    let data = prismCache.get(filePath);
+    if (!data) {
+      const stat = fs.statSync(filePath);
+      if (!stat.isFile()) {
+        res.writeHead(404, { 'Content-Type': 'text/plain' });
+        res.end('Not found');
+        return;
+      }
+      data = fs.readFileSync(filePath);
+      if (prismCache.size >= PRISM_CACHE_MAX) prismCache.clear();
+      prismCache.set(filePath, data);
+    }
+
+    res.writeHead(200, {
+      'Content-Type': prismMime(path.extname(filePath).toLowerCase()),
+      'Cache-Control': 'public, max-age=86400',
+    });
     res.end(data);
-  } catch {
-    res.writeHead(500, { 'Content-Type': 'text/plain' });
-    res.end('Read error');
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+      res.writeHead(404, { 'Content-Type': 'text/plain' });
+      res.end('Not found');
+    } else {
+      console.error('[feedback-mcp] Prism asset read error:', err);
+      res.writeHead(500, { 'Content-Type': 'text/plain' });
+      res.end('Read error');
+    }
   }
+}
+
+/** BrowserBackend 构造选项（测试注入点） */
+export interface BrowserBackendOptions {
+  /** 自定义浏览器启动器（默认 launchBrowserForUrl） */
+  launcher?: (url: string) => Promise<string>;
+  /** 服务器就绪回调（集成测试用来获取 URL） */
+  onServerReady?: (url: string) => void;
+  /** 对话框结束后的延迟关停毫秒数（默认 2000；测试可注入更小值加速收尾） */
+  postResolveTeardownMs?: number;
 }
 
 /**
@@ -69,49 +150,91 @@ function servePrismAsset(reqUrl: string, res: http.ServerResponse): void {
  * 富文本（Markdown + 代码高亮）、跨平台一致、内存较高。
  */
 export class BrowserBackend implements UIBackend {
-  /** 浏览器后端始终可用（只要本机有浏览器） */
+  private readonly launcher: (url: string) => Promise<string>;
+  private readonly onServerReady?: (url: string) => void;
+  private readonly postResolveTeardownMs: number;
+
+  constructor(options: BrowserBackendOptions = {}) {
+    this.launcher = options.launcher ?? launchBrowserForUrl;
+    this.onServerReady = options.onServerReady;
+    this.postResolveTeardownMs = Math.max(0, options.postResolveTeardownMs ?? POST_RESOLVE_TEARDOWN_MS);
+  }
+
+  /** 浏览器后端始终可用（只要本机有浏览器，启动失败会在 show 结果中报错） */
   async isAvailable(): Promise<boolean> {
     return true;
   }
 
   /** 展示浏览器对话框并等待用户响应 */
   show(options: DialogOptions): Promise<DialogResult> {
-    const timeout = options.timeout || 300000; // 默认5分钟
-    let server: http.Server | null = null;
-    let timeoutId: NodeJS.Timeout | null = null;
+    // 钳制到 Node 定时器上限，防止溢出导致定时器立即触发
+    const timeout = Math.min(options.timeout || 300000, MAX_TIMER_MS);
+    // 会话令牌：页面脚本持有，POST 端点必须匹配（跨站网页无法读取）
+    const token = randomBytes(24).toString('base64url');
 
-    return new Promise((resolve) => {
+    return new Promise<DialogResult>((resolve) => {
+      let server: http.Server | null = null;
+      let timeoutId: NodeJS.Timeout | null = null;
+      let teardownTimer: NodeJS.Timeout | null = null;
       let resolved = false;
+      let pageSeen = false;
+      const sockets = new Set<Socket>();
+      let allowedHosts: string[] = [];
 
-      const cleanup = () => {
+      // 终局关停：停止接收新连接，短暂冲刷在途响应后强制销毁残余 socket
+      const teardown = () => {
+        teardownTimer = null;
         if (timeoutId) {
           clearTimeout(timeoutId);
           timeoutId = null;
         }
-        if (server) {
+        if (!server) return;
+        try {
           server.close();
-          server = null;
+        } catch {
+          /* 已关闭 */
         }
+        // server.close() 不中断 keep-alive 连接；先关空闲，短暂冲刷后强制销毁残余
+        server.closeIdleConnections?.();
+        const hardKill = setTimeout(() => {
+          for (const s of sockets) s.destroy();
+          server?.closeAllConnections?.();
+        }, SOCKET_DRAIN_MS);
+        hardKill.unref?.();
+        server = null;
       };
 
-      const resolveOnce = (result: DialogResult) => {
-        if (!resolved) {
-          resolved = true;
-          cleanup();
-          resolve(result);
-        }
+      // 结束后的关停调度：页面已加载过的窗口持有自己的收尾逻辑（JS 自关），
+      // 稍等在途请求冲刷即可；页面从未加载过的（浏览器冷启动慢/脚本方秒速提交）
+      // 则继续等首次加载，届时改送收尾页让晚到的窗口自行关闭，
+      // 而不是对着"无法访问此网站"错误页永久卡死。
+      const scheduleTeardown = (delayMs: number) => {
+        if (teardownTimer) clearTimeout(teardownTimer);
+        teardownTimer = setTimeout(teardown, delayMs);
+        teardownTimer.unref?.();
       };
 
-      // 不再截断消息：交给 AI 通过工具描述控制 message 长度，避免误伤正常的长日志/代码
-      const message = options.message;
+      const resolveOnce = (result: DialogResult, teardownMs?: number) => {
+        if (resolved) return;
+        resolved = true;
+        if (timeoutId) {
+          clearTimeout(timeoutId);
+          timeoutId = null;
+        }
+        scheduleTeardown(teardownMs ?? (pageSeen ? this.postResolveTeardownMs : POST_RESOLVE_MAX_WAIT_MS));
+        resolve(result);
+      };
 
-      // 创建HTTP服务器（增强错误处理）
       server = http.createServer((req, res) => {
-        // 统一 JSON 响应收口：保证每个 res 只写一次，
-        // 消除 1MB 限流 destroy、req error、JSON 解析失败之间的重复 writeHead/end 竞态
+        // 客户端断开等流错误不应演化为未处理异常
+        res.on('error', (err) => {
+          console.error('[feedback-mcp] Response error:', err.message);
+        });
+
+        // 统一 JSON 响应收口：保证每个 res 只写一次
         let responded = false;
         const safeJson = (status: number, payload: unknown): void => {
-          if (responded || res.writableEnded) return;
+          if (responded || res.writableEnded || res.destroyed) return;
           responded = true;
           try {
             res.writeHead(status, { 'Content-Type': 'application/json' });
@@ -122,39 +245,64 @@ export class BrowserBackend implements UIBackend {
         };
 
         try {
-          // 处理提交
-          if (req.method === 'POST' && req.url === '/submit') {
-            let body = '';
+          // Host 头校验：只接受本回环地址形式，阻断 DNS rebinding（rebind 域名解析到
+          // 127.0.0.1 后其页面会被同源策略放行读取页面与令牌）
+          const host = (req.headers.host || '').toLowerCase();
+          if (!allowedHosts.includes(host)) {
+            safeJson(403, { error: 'Forbidden host' });
+            return;
+          }
+
+          const url = new URL(req.url || '/', 'http://127.0.0.1');
+          const pathname = url.pathname;
+
+          // 提交（令牌校验 + Buffer 收集体）
+          if (req.method === 'POST' && pathname === '/submit') {
+            if (!tokenMatches(req, token)) {
+              safeJson(403, { error: 'Invalid token' });
+              return;
+            }
+
+            if (resolved) {
+              // 会话已结束后到达的请求（晚到窗口/重复提交）：如实告知已结束，页面据此收尾
+              safeJson(200, { finished: true });
+              return;
+            }
+
+            const chunks: Buffer[] = [];
+            let size = 0;
+            let aborted = false;
 
             req.on('error', (err) => {
               console.error('[feedback-mcp] Request error:', err);
               safeJson(400, { error: 'Request error' });
             });
 
-            req.on('data', chunk => {
-              body += chunk;
-
-              // 防止过大的请求体
-              if (body.length > 1024 * 1024) { // 1MB限制
+            req.on('data', (chunk: Buffer) => {
+              if (aborted) return;
+              size += chunk.length;
+              if (size > MAX_BODY_BYTES) {
+                aborted = true;
                 req.destroy();
                 safeJson(413, { error: 'Request too large' });
                 return;
               }
+              chunks.push(chunk);
             });
 
             req.on('end', () => {
+              if (aborted) return;
               try {
-                const { response } = JSON.parse(body);
+                const body = Buffer.concat(chunks).toString('utf8');
+                const parsed = JSON.parse(body) as { response?: unknown };
 
-                // 验证响应内容
-                if (typeof response !== 'string') {
+                if (typeof parsed.response !== 'string') {
                   safeJson(400, { error: 'Invalid response format' });
                   return;
                 }
 
-                // 不再限制响应长度：用户可能提交大段日志/代码，由 body 1MB 上限兜底防滥用即可
                 safeJson(200, { success: true });
-                resolveOnce({ submitted: true, response });
+                resolveOnce({ submitted: true, response: parsed.response });
               } catch (error) {
                 console.error('[feedback-mcp] Submit JSON parse error:', error);
                 safeJson(400, { error: 'Invalid JSON format' });
@@ -163,283 +311,153 @@ export class BrowserBackend implements UIBackend {
             return;
           }
 
-          // 处理取消
-          if (req.method === 'POST' && req.url === '/cancel') {
+          // 取消（令牌校验）
+          if (req.method === 'POST' && pathname === '/cancel') {
+            if (!tokenMatches(req, token)) {
+              safeJson(403, { error: 'Invalid token' });
+              return;
+            }
+            if (resolved) {
+              safeJson(200, { finished: true });
+              return;
+            }
             safeJson(200, { success: true });
             resolveOnce({ submitted: false });
             return;
           }
 
-          // 处理超时（客户端倒计时到点触发，区别于取消：带 timedOut 标志）
-          if (req.method === 'POST' && req.url === '/timeout') {
+          // 超时上报（客户端倒计时到点触发，区别于取消：带 timedOut 标志）
+          if (req.method === 'POST' && pathname === '/timeout') {
+            if (!tokenMatches(req, token)) {
+              safeJson(403, { error: 'Invalid token' });
+              return;
+            }
+            if (resolved) {
+              safeJson(200, { finished: true });
+              return;
+            }
             safeJson(200, { success: true });
             resolveOnce({ submitted: false, timedOut: true });
             return;
           }
 
-          // 提供本地化的 Prism 静态资源（代码高亮，离线可用，不经 CDN）
-          if (req.url?.startsWith('/prism/')) {
-            servePrismAsset(req.url, res);
+          // 本地化的 Prism 静态资源（代码高亮，离线可用，不经 CDN）
+          if (pathname.startsWith('/prism/')) {
+            if (req.method !== 'GET' && req.method !== 'HEAD') {
+              safeJson(405, { error: 'Method not allowed' });
+              return;
+            }
+            servePrismAsset(pathname, res);
             return;
           }
 
-          // 处理404
-          if (req.url !== '/') {
-            safeJson(404, { error: 'Not found' });
-            return;
-          }
-
-          // 返回HTML页面（含 CSP 与安全头）
-          if (!responded && !res.writableEnded) {
+          // 对话框页面（会话已结束则改送收尾页，让晚到的窗口自行关闭）
+          if (pathname === '/') {
+            if (req.method !== 'GET' && req.method !== 'HEAD') {
+              safeJson(405, { error: 'Method not allowed' });
+              return;
+            }
+            if (responded || res.writableEnded || res.destroyed) return;
+            responded = true;
             res.writeHead(200, {
               'Content-Type': 'text/html; charset=utf-8',
               'Content-Security-Policy': CSP_HEADER,
               'X-Content-Type-Options': 'nosniff',
+              'X-Frame-Options': 'DENY',
               'Referrer-Policy': 'no-referrer',
+              'Cache-Control': 'no-store',
             });
-            res.end(generateHTML(message, timeout, options.language, options.theme));
+            if (req.method === 'HEAD') return;
+
+            pageSeen = true;
+            if (resolved) {
+              scheduleTeardown(this.postResolveTeardownMs);
+              res.end(generateFinalHTML(options.language));
+              return;
+            }
+            res.end(
+              generateHTML(
+                options.message,
+                timeout,
+                options.language,
+                options.theme ?? 'auto',
+                token
+              )
+            );
+            return;
           }
+
+          safeJson(404, { error: 'Not found' });
         } catch (error) {
           console.error('[feedback-mcp] Server error:', error);
           safeJson(500, { error: 'Internal server error' });
         }
       });
 
-      // 监听随机端口
-      server.listen(0, 'localhost', async () => {
-        const address = server!.address();
+      // 跟踪所有连接，保证结束后可彻底释放（防句柄/端口泄漏累积）
+      server.on('connection', (socket) => {
+        sockets.add(socket);
+        socket.on('close', () => sockets.delete(socket));
+      });
+
+      // 请求处理节奏约束：慢速/挂起请求不应长期占用资源
+      server.headersTimeout = 10_000;
+      server.requestTimeout = 60_000;
+      server.keepAliveTimeout = 5_000;
+
+      server.on('error', (error) => {
+        console.error('[feedback-mcp] HTTP server error:', error);
+        resolveOnce({ submitted: false, error: `HTTP server error: ${error.message}` });
+      });
+
+      // 监听回环地址（显式 127.0.0.1，避免 localhost 解析差异与外部暴露）
+      server.listen(options.port ?? 0, '127.0.0.1', async () => {
+        const address = server?.address();
         if (!address || typeof address === 'string') {
-          resolveOnce({ submitted: false });
+          resolveOnce({ submitted: false, error: 'Failed to bind local server' });
           return;
         }
 
         const port = address.port;
-        const url = `http://localhost:${port}`;
+        allowedHosts = [`127.0.0.1:${port}`, `localhost:${port}`, `[::1]:${port}`];
+        const url = `http://127.0.0.1:${port}`;
 
         console.error(`[feedback-mcp] Dialog opened at ${url}`);
+        this.onServerReady?.(url);
 
-        // 打开轻量级浏览器窗口（App模式）
+        // 打开浏览器窗口；启动失败必须显式报错，不能伪装成"用户取消"
         try {
-          let browserOpened = false;
-
-          // 首先尝试找到浏览器的完整路径
-          const findBrowserPath = async (): Promise<string | null> => {
-            const commonPaths = [];
-
-            if (process.platform === 'win32') {
-              // Windows常见浏览器路径
-              const programFiles = process.env.PROGRAMFILES || 'C:\\Program Files';
-              const programFilesX86 = process.env['PROGRAMFILES(X86)'] || 'C:\\Program Files (x86)';
-              const localAppData = process.env.LOCALAPPDATA || path.join(process.env.USERPROFILE || '', 'AppData', 'Local');
-
-              // Chrome
-              commonPaths.push(
-                path.join(programFiles, 'Google', 'Chrome', 'Application', 'chrome.exe'),
-                path.join(programFilesX86, 'Google', 'Chrome', 'Application', 'chrome.exe'),
-                path.join(localAppData, 'Google', 'Chrome', 'Application', 'chrome.exe')
-              );
-
-              // Edge
-              commonPaths.push(
-                path.join(programFiles, 'Microsoft', 'Edge', 'Application', 'msedge.exe'),
-                path.join(programFilesX86, 'Microsoft', 'Edge', 'Application', 'msedge.exe')
-              );
-
-              // Firefox
-              commonPaths.push(
-                path.join(programFiles, 'Mozilla Firefox', 'firefox.exe'),
-                path.join(programFilesX86, 'Mozilla Firefox', 'firefox.exe'),
-                path.join(localAppData, 'Programs', 'Firefox', 'firefox.exe')
-              );
-
-            } else if (process.platform === 'darwin') {
-              // macOS常见浏览器路径
-              commonPaths.push(
-                // Chrome
-                '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
-                // Edge
-                '/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge',
-                // Firefox
-                '/Applications/Firefox.app/Contents/MacOS/firefox',
-                '/Applications/Firefox Developer Edition.app/Contents/MacOS/firefox',
-                // Safari (不支持app模式，但可以作为备用)
-                '/Applications/Safari.app/Contents/MacOS/Safari'
-              );
-            } else {
-              // Linux常见浏览器路径
-              commonPaths.push(
-                // Chrome/Chromium
-                '/usr/bin/google-chrome',
-                '/usr/bin/google-chrome-stable',
-                '/usr/bin/chromium-browser',
-                '/usr/bin/chromium',
-                '/snap/bin/chromium',
-                // Edge
-                '/usr/bin/microsoft-edge',
-                '/opt/microsoft/msedge/msedge',
-                // Firefox
-                '/usr/bin/firefox',
-                '/usr/bin/firefox-esr',
-                '/snap/bin/firefox'
-              );
-            }
-
-            // 检查哪个路径存在（优先Chrome/Edge，然后Firefox）
-            for (const browserPath of commonPaths) {
-              if (fs.existsSync(browserPath)) {
-                console.error(`[feedback-mcp] Found browser at: ${browserPath}`);
-                return browserPath;
-              }
-            }
-
-            // 尝试在PATH中查找
-            try {
-              if (process.platform === 'win32') {
-                const { stdout } = await execAsync('where chrome 2>nul || where msedge 2>nul || where firefox 2>nul || echo notfound');
-                const cmdPath = stdout.trim();
-                return cmdPath !== 'notfound' ? cmdPath : null;
-              } else {
-                const { stdout } = await execAsync('which google-chrome 2>/dev/null || which msedge 2>/dev/null || which firefox 2>/dev/null || echo notfound');
-                const cmdPath = stdout.trim();
-                return cmdPath !== 'notfound' ? cmdPath : null;
-              }
-            } catch {
-              return null;
-            }
-          };
-
-          // 尝试启动浏览器App模式
-          const launchAppMode = async (browserPath: string, browserName: string): Promise<boolean> => {
-            return new Promise((resolve) => {
-              const args = [
-                `--app=${url}`,
-                '--window-size=900,700',
-                '--new-window',
-                '--always-on-top'
-              ];
-
-              console.error(`[feedback-mcp] Launching ${browserName} with args:`, args);
-
-              const child = spawn(browserPath, args, {
-                detached: true,
-                stdio: 'ignore'
-              });
-
-              child.on('error', (err) => {
-                console.error(`[feedback-mcp] ${browserName} launch failed:`, err.message);
-                resolve(false);
-              });
-
-              child.on('spawn', () => {
-                console.error(`[feedback-mcp] ${browserName} app mode launched successfully`);
-                child.unref();
-                resolve(true);
-              });
-
-              // 如果进程在2秒内没有spawn，认为失败
-              setTimeout(() => {
-                resolve(false);
-              }, 2000);
-            });
-          };
-
-          // 启动普通模式（用于不支持app模式的浏览器）
-          const launchRegularMode = async (browserPath: string, browserName: string): Promise<boolean> => {
-            return new Promise((resolve) => {
-              // Safari和Firefox的普通模式参数
-              let args = [url];
-
-              if (browserName === 'Firefox') {
-                // Firefox特定参数
-                args = [
-                  '--new-window',
-                  '--width=900',
-                  '--height=700',
-                  url
-                ];
-              } else if (browserName === 'Safari') {
-                // Safari特定参数
-                args = [url];
-              }
-
-              console.error(`[feedback-mcp] Launching ${browserName} in regular mode with args:`, args);
-
-              const child = spawn(browserPath, args, {
-                detached: true,
-                stdio: 'ignore'
-              });
-
-              child.on('error', (err) => {
-                console.error(`[feedback-mcp] ${browserName} regular mode failed:`, err.message);
-                resolve(false);
-              });
-
-              child.on('spawn', () => {
-                console.error(`[feedback-mcp] ${browserName} regular mode launched successfully`);
-                child.unref();
-                resolve(true);
-              });
-
-              // 如果进程在3秒内没有spawn，认为失败
-              setTimeout(() => {
-                resolve(false);
-              }, 3000);
-            });
-          };
-
-          // 根据浏览器完整路径检测类型并启动（Chrome/Edge 走 app 模式；Firefox/Safari 走普通窗口）
-          const launchDetectedBrowser = async (browserPath: string): Promise<boolean> => {
-            const lowerPath = browserPath.toLowerCase();
-            const isFirefox = lowerPath.includes('firefox');
-            const isSafari = lowerPath.includes('safari');
-
-            let browserName = 'Chrome';
-            if (lowerPath.includes('edge')) browserName = 'Edge';
-            else if (isFirefox) browserName = 'Firefox';
-            else if (isSafari) browserName = 'Safari';
-
-            // Firefox 与 Safari 不支持 app 模式，使用普通窗口
-            if (isFirefox || isSafari) {
-              console.error(`[feedback-mcp] ${browserName} detected, using regular window mode`);
-              return launchRegularMode(browserPath, browserName);
-            }
-            return launchAppMode(browserPath, browserName);
-          };
-
-          // 查找浏览器完整路径并启动。
-          // 不再使用 "start chrome"：chrome 多数不在 PATH 会静默失败，且 startArgs 字符串拼接经 shell 有注入面。
-          const browserPath = await findBrowserPath();
-          if (browserPath) {
-            browserOpened = await launchDetectedBrowser(browserPath);
-            if (!browserOpened) {
-              console.error('[feedback-mcp] Browser launch failed, trying default browser');
-            }
-          } else {
-            console.error('[feedback-mcp] No known browser found, trying default browser');
-          }
-
-          // 如果App模式失败，使用默认浏览器
-          if (!browserOpened) {
-            console.error('[feedback-mcp] Using default browser as fallback');
-            await open(url);
-          }
+          const how = await this.launcher(url);
+          console.error(`[feedback-mcp] Dialog window opened via ${how}`);
         } catch (error) {
           console.error('[feedback-mcp] Failed to open browser:', error);
-          resolveOnce({ submitted: false });
+          // 启动失败意味着不会有窗口到来，无需为晚到的页面长期保留服务
+          resolveOnce({
+            submitted: false,
+            error: `Failed to open dialog window: ${error instanceof Error ? error.message : String(error)}`,
+          }, 1000);
           return;
         }
 
-        // 设置超时
+        // 服务器侧超时兜底（客户端上报与本地定时器先到者生效，resolveOnce 幂等）
         timeoutId = setTimeout(() => {
           console.error('[feedback-mcp] Dialog timed out');
           resolveOnce({ submitted: false, timedOut: true });
         }, timeout);
       });
-
-      server.on('error', (error) => {
-        console.error('[feedback-mcp] Server error:', error);
-        resolveOnce({ submitted: false });
-      });
     });
+  }
+}
+
+/** 校验请求令牌（Header 优先，兼容查询参数） */
+function tokenMatches(req: http.IncomingMessage, token: string): boolean {
+  const header = req.headers['x-feedback-token'];
+  const headerToken = Array.isArray(header) ? header[0] : header;
+  if (headerToken) return headerToken === token;
+  try {
+    const tokenParam = new URL(req.url || '/', 'http://127.0.0.1').searchParams.get('token');
+    return tokenParam === token;
+  } catch {
+    return false;
   }
 }

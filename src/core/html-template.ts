@@ -3,16 +3,20 @@
  *
  * {@link generateHTML} 生成完整的对话框 HTML（石墨极简样式 + 本地 Prism 高亮 + 客户端交互逻辑），
  * 内容由 {@link renderMarkdownSafe} 净化后插入，确保无 XSS。
+ *
+ * 安全要点：用户消息原文会以 `JSON.stringify` 形式内嵌到 `<script>`（供"复制为 Markdown"用），
+ * 必须经 {@link jsonForInlineScript} 转义 `<`/`>`/U+2028/U+2029，否则消息中出现的
+ * `</script>` 字面量会提前终止脚本块，构成 HTML 注入。
  */
 
 import { renderMarkdownSafe } from './markdown.js';
-import type { ThemeMode } from './types.js';
+import type { Language, ThemeMode } from './types.js';
 
 /**
  * Content-Security-Policy 响应头。
  *
  * 纵深防御：即便 sanitize 净化层被绕过，connect-src 'self' 也能阻止脚本把数据外泄到外部，
- * object-src/frame-src 'none' 阻止插件与嵌入帧。
+ * object-src/frame-src 'none'、frame-ancestors 'none' 阻止插件与嵌入帧。
  * 说明：script-src/style-src 暂需 'unsafe-inline'，因为当前页面是内联脚本/样式。
  */
 export const CSP_HEADER =
@@ -25,69 +29,132 @@ export const CSP_HEADER =
   "object-src 'none'; " +
   "base-uri 'self'; " +
   "frame-src 'none'; " +
+  "frame-ancestors 'none'; " +
   "form-action 'self'";
+
+/**
+ * 将值序列化为可安全内嵌 `<script>` 的 JSON 字面量。
+ *
+ * JSON.stringify 不转义 `/`，`</script>` 会终结脚本块；`<`/`>`/`&` 统一转义为
+ * `\uXXXX` 序列，同时处理 U+2028/U+2029（旧引擎里的换行语义）。
+ */
+export function jsonForInlineScript(value: string): string {
+  return JSON.stringify(value)
+    .replace(/</g, '\\u003c')
+    .replace(/>/g, '\\u003e')
+    .replace(/&/g, '\\u0026')
+    .replace(/\u2028/g, '\\u2028')
+    .replace(/\u2029/g, '\\u2029');
+}
+
+/** 界面文案表 */
+interface UIText {
+  title: string;
+  description: string;
+  timerPrefix: string;
+  copyPlain: string;
+  copyMarkdown: string;
+  copySuccess: string;
+  inputLabel: string;
+  inputPlaceholder: string;
+  submit: string;
+  cancel: string;
+  themeToggleDark: string;
+  themeToggleLight: string;
+  themeToggleTitle: string;
+  timeoutMessage: string;
+  submitSuccess: string;
+  cancelMessage: string;
+  shortcutsHint: string;
+  errorMessage: string;
+  retryButton: string;
+  submitting: string;
+  cancelling: string;
+  manualCloseHint: string;
+  finishedTitle: string;
+}
+
+/** 按语言取界面文案（未知语言回退中文） */
+function getUIText(language: Language): UIText {
+  return language === 'en'
+    ? {
+        title: 'Interactive Feedback',
+        description: 'Please review the following information and provide your feedback',
+        timerPrefix: 'Time remaining: ',
+        copyPlain: 'Copy as Plain Text',
+        copyMarkdown: 'Copy as Markdown',
+        copySuccess: 'Copied',
+        inputLabel: 'Your response:',
+        inputPlaceholder: 'Please enter your response here...',
+        submit: 'Submit',
+        cancel: 'Cancel',
+        themeToggleDark: 'Dark',
+        themeToggleLight: 'Light',
+        themeToggleTitle: 'Toggle theme',
+        timeoutMessage: 'Timeout — window will close...',
+        submitSuccess: 'Submitted — window will close...',
+        cancelMessage: 'Cancelled — window will close...',
+        shortcutsHint: 'Shortcuts: Ctrl+Enter to submit · Esc to cancel',
+        errorMessage: 'Error occurred, please retry',
+        retryButton: 'Retry',
+        submitting: 'Submitting...',
+        cancelling: 'Processing...',
+        manualCloseHint: '(close this window manually if it does not close itself)',
+        finishedTitle: 'Session ended',
+      }
+    : {
+        title: '交互式反馈',
+        description: '请查看以下信息并提供您的反馈',
+        timerPrefix: '剩余时间：',
+        copyPlain: '复制为纯文本',
+        copyMarkdown: '复制为 Markdown',
+        copySuccess: '已复制',
+        inputLabel: '您的回复：',
+        inputPlaceholder: '请在此输入您的回复...',
+        submit: '提交',
+        cancel: '取消',
+        themeToggleDark: '深色',
+        themeToggleLight: '浅色',
+        themeToggleTitle: '切换主题',
+        timeoutMessage: '已超时——窗口将自动关闭',
+        submitSuccess: '已提交——窗口将自动关闭',
+        cancelMessage: '已取消——窗口将自动关闭',
+        shortcutsHint: '快捷键：Ctrl+Enter 提交 · Esc 取消',
+        errorMessage: '发生错误，请重试',
+        retryButton: '重试',
+        submitting: '提交中...',
+        cancelling: '处理中...',
+        manualCloseHint: '（若窗口未自动关闭，请手动关闭）',
+        finishedTitle: '会话已结束',
+      };
+}
 
 /**
  * 生成对话框 HTML 页面。
  *
  * @param message - Markdown 原文（将经 renderMarkdownSafe 净化）
  * @param timeout - 超时时间（毫秒）
- * @param language - 界面语言（'zh' | 'en'）
- * @param theme - 主题模式（'auto' 跟随系统 / 'light' / 'dark'）
+ * @param language - 界面语言（未知值回退 zh）
+ * @param theme - 主题模式（未知值回退 auto）
+ * @param token - 会话令牌（客户端提交/取消时携带，防本机恶意网页跨站伪造请求）
  * @returns 完整 HTML 页面字符串
  */
-export function generateHTML(message: string, timeout: number, language: string, theme: ThemeMode = 'auto'): string {
+export function generateHTML(
+  message: string,
+  timeout: number,
+  language: string,
+  theme: string,
+  token: string
+): string {
   const processedMessage = renderMarkdownSafe(message);
 
-  // 根据语言选择UI文本
-  const uiText = language === 'en' ? {
-    title: 'Interactive Feedback',
-    description: 'Please review the following information and provide your feedback',
-    timerPrefix: 'Time remaining: ',
-    copyPlain: 'Copy as Plain Text',
-    copyMarkdown: 'Copy as Markdown',
-    copySuccess: 'Copied',
-    inputLabel: 'Your response:',
-    inputPlaceholder: 'Please enter your response here...',
-    submit: 'Submit',
-    cancel: 'Cancel',
-    themeToggleDark: 'Dark',
-    themeToggleLight: 'Light',
-    themeToggleTitle: 'Toggle theme',
-    timeoutMessage: 'Timeout — window will close...',
-    submitSuccess: 'Submitted — window will close...',
-    cancelMessage: 'Cancelled — window will close...',
-    shortcutsHint: 'Shortcuts: Ctrl+Enter to submit · Esc to cancel',
-    errorMessage: 'Error occurred, please retry',
-    retryButton: 'Retry',
-    submitting: 'Submitting...',
-    cancelling: 'Processing...'
-  } : {
-    title: '交互式反馈',
-    description: '请查看以下信息并提供您的反馈',
-    timerPrefix: '剩余时间：',
-    copyPlain: '复制为纯文本',
-    copyMarkdown: '复制为 Markdown',
-    copySuccess: '已复制',
-    inputLabel: '您的回复：',
-    inputPlaceholder: '请在此输入您的回复...',
-    submit: '提交',
-    cancel: '取消',
-    themeToggleDark: '深色',
-    themeToggleLight: '浅色',
-    themeToggleTitle: '切换主题',
-    timeoutMessage: '已超时——窗口将自动关闭',
-    submitSuccess: '已提交——窗口将自动关闭',
-    cancelMessage: '已取消——窗口将自动关闭',
-    shortcutsHint: '快捷键：Ctrl+Enter 提交 · Esc 取消',
-    errorMessage: '发生错误，请重试',
-    retryButton: '重试',
-    submitting: '提交中...',
-    cancelling: '处理中...'
-  };
+  // 防御性白名单：本模板是导出 API，不能信任调用方已校验
+  const lang: Language = language === 'en' ? 'en' : 'zh';
+  const safeTheme: ThemeMode = theme === 'light' || theme === 'dark' ? theme : 'auto';
+  const uiText = getUIText(lang);
 
   return `<!DOCTYPE html>
-<html lang="${language}">
+<html lang="${lang}">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -446,36 +513,57 @@ export function generateHTML(message: string, timeout: number, language: string,
   </div>
 
   <script>
-    const originalMarkdown = ${JSON.stringify(message)};
-    let timeoutSeconds = ${Math.floor(timeout / 1000)};
+    const originalMarkdown = ${jsonForInlineScript(message)};
+    // 会话令牌：提交/取消请求必须携带（防本机其他网页跨站伪造）
+    const FEEDBACK_TOKEN = ${jsonForInlineScript(token)};
+    // 超时截止时刻（基于绝对时间计算剩余，规避链式 setTimeout 漂移与后台节流误差）
+    const deadline = Date.now() + ${Math.max(0, Math.floor(timeout))};
     // 主题模式（服务端注入）：auto 跟随系统 / light / dark
-    const themeMode = '${theme}';
+    const themeMode = ${jsonForInlineScript(safeTheme)};
     // 防重入状态：避免按钮与快捷键重复触发 submit/cancel
     let submitting = false;
     let cancelling = false;
 
-    // 更新倒计时
-    function updateTimer() {
-      const minutes = Math.floor(timeoutSeconds / 60);
-      const seconds = timeoutSeconds % 60;
-      document.getElementById('timer').textContent =
-        \`${uiText.timerPrefix}\${minutes}:\${seconds.toString().padStart(2, '0')}\`;
+    // 携带令牌的 POST
+    function post(path, options) {
+      const opts = options || {};
+      opts.method = 'POST';
+      opts.headers = Object.assign({ 'X-Feedback-Token': FEEDBACK_TOKEN }, opts.headers || {});
+      return fetch(path, opts);
+    }
 
-      if (timeoutSeconds > 0) {
-        timeoutSeconds--;
+    // 更新倒计时（每次由 deadline 重算，后台标签页节流也不会失真）
+    function updateTimer() {
+      const timerEl = document.getElementById('timer');
+      const remainingMs = deadline - Date.now();
+
+      if (remainingMs > 0) {
+        const totalSec = Math.ceil(remainingMs / 1000);
+        const minutes = Math.floor(totalSec / 60);
+        const seconds = totalSec % 60;
+        timerEl.textContent =
+          \`${uiText.timerPrefix}\${minutes}:\${seconds.toString().padStart(2, '0')}\`;
         setTimeout(updateTimer, 1000);
       } else {
-        document.getElementById('timer').textContent = '${uiText.timeoutMessage}';
-        setTimeout(() => {
-          timeoutSubmit();
-        }, 2000);
+        timerEl.textContent = '${uiText.timeoutMessage}';
+        timerEl.classList.add('timeout');
+        setTimeout(timeoutSubmit, 1500);
       }
+    }
+
+    // 尝试自行关闭窗口：Chromium app 窗口/单历史记录标签可自关；
+    // Firefox/Safari 普通窗口可能拒绝脚本关闭，此时保留画面由用户手动关闭。
+    function tryCloseWindow() {
+      try { window.open('', '_self'); } catch (e) { /* ignore */ }
+      window.close();
+      setTimeout(function () { try { window.close(); } catch (e) { /* ignore */ } }, 300);
     }
 
     // 超时上报（区别于取消：服务端记录为 timedOut，便于 AI 区分"超时"与"主动取消"）
     function timeoutSubmit() {
-      fetch('/timeout', { method: 'POST' }).finally(() => {
-        setTimeout(() => window.close(), 1000);
+      showFinalScreen('${uiText.timeoutMessage}');
+      post('/timeout').catch(function () {}).finally(function () {
+        setTimeout(tryCloseWindow, 800);
       });
     }
 
@@ -498,16 +586,19 @@ export function generateHTML(message: string, timeout: number, language: string,
       return window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
     }
 
-    // 主题切换（手动覆盖，记忆到 localStorage）
+    // 主题切换（手动覆盖，记忆到 localStorage；仅固定端口时跨会话生效）
     function toggleTheme() {
       const isDark = document.body.classList.contains('dark-theme');
       applyTheme(!isDark);
-      localStorage.setItem('feedback-mcp-theme', !isDark ? 'dark' : 'light');
+      try {
+        localStorage.setItem('feedback-mcp-theme', !isDark ? 'dark' : 'light');
+      } catch (e) { /* 隐私模式等存储不可用 */ }
     }
 
     // 恢复主题：用户手动偏好(localStorage) > themeMode 配置 > 系统跟随(auto)
     function restoreTheme() {
-      const savedTheme = localStorage.getItem('feedback-mcp-theme');
+      let savedTheme = null;
+      try { savedTheme = localStorage.getItem('feedback-mcp-theme'); } catch (e) { /* ignore */ }
       if (savedTheme === 'dark') { applyTheme(true); return; }
       if (savedTheme === 'light') { applyTheme(false); return; }
       if (themeMode === 'dark') applyTheme(true);
@@ -520,79 +611,28 @@ export function generateHTML(message: string, timeout: number, language: string,
       try {
         const mql = window.matchMedia('(prefers-color-scheme: dark)');
         if (mql.addEventListener) {
-          mql.addEventListener('change', () => {
-            if (!localStorage.getItem('feedback-mcp-theme')) applyTheme(resolveAutoDark());
+          mql.addEventListener('change', function () {
+            let saved = null;
+            try { saved = localStorage.getItem('feedback-mcp-theme'); } catch (e) { /* ignore */ }
+            if (!saved) applyTheme(resolveAutoDark());
           });
         }
       } catch (e) { /* 忽略老浏览器 */ }
     }
 
-    // 页面加载时恢复主题和窗口位置
     restoreTheme();
-    restoreWindowPosition();
-
-    // 保存窗口位置
-    function saveWindowPosition() {
-      try {
-        localStorage.setItem('feedback-mcp-window-pos', JSON.stringify({
-          left: window.screenX,
-          top: window.screenY,
-          width: window.outerWidth,
-          height: window.outerHeight
-        }));
-      } catch (e) {
-        // 忽略存储错误
-      }
-    }
-
-    // 恢复窗口位置（仅在支持App模式的浏览器中有效）
-    function restoreWindowPosition() {
-      try {
-        const saved = localStorage.getItem('feedback-mcp-window-pos');
-        if (saved) {
-          const pos = JSON.parse(saved);
-          // 对于App模式窗口，尝试移动到保存的位置
-          if (window.opener === null && window.top === window) {
-            // 检查是否在合理范围内
-            const isValidPosition =
-              pos.left >= 0 && pos.top >= 0 &&
-              pos.left < screen.width && pos.top < screen.height &&
-              pos.width > 100 && pos.height > 100;
-
-            if (isValidPosition) {
-              window.moveTo(pos.left, pos.top);
-            }
-          }
-        }
-      } catch (e) {
-        // 忽略恢复错误
-      }
-    }
-
-    // 监听窗口移动和大小变化
-    let saveTimeout;
-    function scheduleSave() {
-      clearTimeout(saveTimeout);
-      saveTimeout = setTimeout(saveWindowPosition, 500);
-    }
-
-    window.addEventListener('move', scheduleSave);
-    window.addEventListener('resize', scheduleSave);
-
-    // 页面关闭时保存
-    window.addEventListener('beforeunload', saveWindowPosition);
 
     // 复制为纯文本
     function copyAsPlainText(e) {
       const content = document.getElementById('content').innerText;
-      navigator.clipboard.writeText(content).then(() => {
+      navigator.clipboard.writeText(content).then(function () {
         showCopied(e.currentTarget);
       });
     }
 
     // 复制为Markdown
     function copyAsMarkdown(e) {
-      navigator.clipboard.writeText(originalMarkdown).then(() => {
+      navigator.clipboard.writeText(originalMarkdown).then(function () {
         showCopied(e.currentTarget);
       });
     }
@@ -602,13 +642,13 @@ export function generateHTML(message: string, timeout: number, language: string,
       const originalText = button.textContent;
       button.textContent = '${uiText.copySuccess}';
       button.classList.add('copied');
-      setTimeout(() => {
+      setTimeout(function () {
         button.textContent = originalText;
         button.classList.remove('copied');
       }, 2000);
     }
 
-    // 提交响应（带重试机制 + 防重入）
+    // 提交响应（带错误处理 + 防重入）
     function submitResponse() {
       if (submitting) return;
       submitting = true;
@@ -617,22 +657,20 @@ export function generateHTML(message: string, timeout: number, language: string,
       const submitBtn = document.querySelector('.btn-primary');
       const originalText = submitBtn.textContent;
 
-      // 显示加载状态
       submitBtn.textContent = '${uiText.submitting}';
       submitBtn.disabled = true;
 
-      fetch('/submit', {
-        method: 'POST',
+      post('/submit', {
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ response })
-      }).then((res) => {
+        body: JSON.stringify({ response: response })
+      }).then(function (res) {
         if (res.ok) {
-          document.body.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;min-height:100vh;font-size:24px;color:white;">${uiText.submitSuccess}</div>';
-          setTimeout(() => window.close(), 1500);
+          showFinalScreen('${uiText.submitSuccess}');
+          setTimeout(tryCloseWindow, 1500);
         } else {
-          throw new Error(\`HTTP \${res.status}\`);
+          throw new Error('HTTP ' + res.status);
         }
-      }).catch((error) => {
+      }).catch(function (error) {
         console.error('[feedback-mcp] Submit error:', error);
         submitting = false;
         submitBtn.textContent = originalText;
@@ -652,22 +690,29 @@ export function generateHTML(message: string, timeout: number, language: string,
       cancelBtn.textContent = '${uiText.cancelling}';
       cancelBtn.disabled = true;
 
-      fetch('/cancel', { method: 'POST' })
-        .then((res) => {
-          if (res.ok) {
-            document.body.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;min-height:100vh;font-size:24px;color:white;">${uiText.cancelMessage}</div>';
-            setTimeout(() => window.close(), 1500);
-          } else {
-            throw new Error(\`HTTP \${res.status}\`);
-          }
-        })
-        .catch((error) => {
-          console.error('[feedback-mcp] Cancel error:', error);
-          cancelling = false;
-          cancelBtn.textContent = originalText;
-          cancelBtn.disabled = false;
-          showError('${uiText.errorMessage} (' + error.message + ')');
-        });
+      post('/cancel').then(function (res) {
+        if (res.ok) {
+          showFinalScreen('${uiText.cancelMessage}');
+          setTimeout(tryCloseWindow, 1500);
+        } else {
+          throw new Error('HTTP ' + res.status);
+        }
+      }).catch(function (error) {
+        console.error('[feedback-mcp] Cancel error:', error);
+        cancelling = false;
+        cancelBtn.textContent = originalText;
+        cancelBtn.disabled = false;
+        showError('${uiText.errorMessage} (' + error.message + ')');
+      });
+    }
+
+    // 结束画面（window.close 可能被浏览器拒绝，提示手动关闭）
+    function showFinalScreen(message) {
+      document.body.innerHTML =
+        '<div style="display:flex;flex-direction:column;align-items:center;justify-content:center;' +
+        'gap:12px;min-height:100vh;font-size:22px;color:#1f232a;background:#f4f5f7;">' +
+        '<div>' + message + '</div>' +
+        '<div style="font-size:13px;color:#6b7280;">${uiText.manualCloseHint}</div></div>';
     }
 
     // 显示错误信息
@@ -695,16 +740,18 @@ export function generateHTML(message: string, timeout: number, language: string,
       document.body.appendChild(errorDiv);
 
       // 3秒后自动移除
-      setTimeout(() => {
+      setTimeout(function () {
         if (errorDiv.parentNode) {
           errorDiv.parentNode.removeChild(errorDiv);
         }
       }, 3000);
     }
 
-    // 快捷键支持
-    document.addEventListener('keydown', (e) => {
+    // 快捷键支持（输入法组词期间的按键不触发，避免中文输入时误取消）
+    document.addEventListener('keydown', function (e) {
+      if (e.isComposing) return;
       if (e.ctrlKey && e.key === 'Enter') {
+        e.preventDefault();
         submitResponse();
       } else if (e.key === 'Escape') {
         cancel();
@@ -731,6 +778,65 @@ export function generateHTML(message: string, timeout: number, language: string,
   <script src="/prism/components/prism-sql.js"></script>
   <script src="/prism/components/prism-yaml.js"></script>
   <script>if (window.Prism) { Prism.highlightAll(); }</script>
+</body>
+</html>`;
+}
+
+/**
+ * 生成"会话已结束"收尾页。
+ *
+ * 用于对话框已在服务端结束（提交/取消/超时/出错）之后才到达的浏览器窗口：
+ * 浏览器冷启动慢或脚本方秒速提交时，窗口可能在这时才发起首次加载——
+ * 若服务已关停，它会停在"无法访问此网站"错误页且没有任何 JS 能关闭它。
+ * 给它返回收尾页即可自行关闭（Chromium），或至少给出明确提示（Firefox/Safari）。
+ *
+ * @param language - 界面语言（未知值回退 zh）
+ * @returns 收尾页 HTML
+ */
+export function generateFinalHTML(language: string): string {
+  const lang: Language = language === 'en' ? 'en' : 'zh';
+  const uiText = getUIText(lang);
+
+  return `<!DOCTYPE html>
+<html lang="${lang}">
+<head>
+  <meta charset="UTF-8">
+  <title>${uiText.finishedTitle}</title>
+  <style>
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+      background: #f4f5f7;
+    }
+    .box {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 12px;
+      font-size: 22px;
+      color: #1f232a;
+    }
+    .hint { font-size: 13px; color: #6b7280; }
+  </style>
+</head>
+<body>
+  <div class="box">
+    <div>${uiText.finishedTitle}</div>
+    <div class="hint">${uiText.manualCloseHint}</div>
+  </div>
+  <script>
+    // 尝试自行关闭窗口；被拒绝时上面的提示仍然可见
+    function tryCloseWindow() {
+      try { window.open('', '_self'); } catch (e) { /* ignore */ }
+      window.close();
+      setTimeout(function () { try { window.close(); } catch (e) { /* ignore */ } }, 300);
+    }
+    tryCloseWindow();
+  </script>
 </body>
 </html>`;
 }

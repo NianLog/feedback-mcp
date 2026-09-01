@@ -11,18 +11,23 @@ export type UIBackendType = 'auto' | 'browser' | 'native';
 /** 主题模式：auto 跟随系统 / light / dark */
 export type ThemeMode = 'auto' | 'light' | 'dark';
 
+/** 界面语言 */
+export type Language = 'zh' | 'en';
+
 /** 对话框配置选项 */
 export interface DialogOptions {
   /** 消息内容（支持 Markdown 格式） */
   message: string;
   /** 超时时间（毫秒），默认 300000ms（5 分钟） */
   timeout?: number;
-  /** 界面语言（'zh' | 'en'） */
-  language: string;
+  /** 界面语言 */
+  language: Language;
   /** UI 后端选择，默认 browser（富文本）；native 为系统对话框（纯文本，省内存） */
   ui?: UIBackendType;
   /** 主题模式，默认 auto（跟随系统 prefers-color-scheme） */
   theme?: ThemeMode;
+  /** 浏览器后端监听端口（0 = 随机）。固定端口可让 localStorage 主题偏好跨会话生效 */
+  port?: number;
 }
 
 /** 对话框返回结果 */
@@ -33,6 +38,11 @@ export interface DialogResult {
   response?: string;
   /** 是否因超时而结束 */
   timedOut?: boolean;
+  /**
+   * 对话框未能正常展示/收集结果时的错误说明（如浏览器启动失败、原生工具缺失）。
+   * 置位时上层应以 isError 语义告知 AI，而不是误报为"用户取消"。
+   */
+  error?: string;
 }
 
 /**

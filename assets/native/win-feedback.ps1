@@ -1,86 +1,135 @@
-# feedback-mcp native Windows 对话框（WinForms 多行输入 + 超时）
+# feedback-mcp native Windows dialog (WinForms multiline input + timeout)
 #
-# 由 backends/native-backend.ts 通过 powershell.exe -File 调用。
-# stdout 输出单行 JSON：{"status":"submitted|cancelled|timeout","response":"..."}
-# - submitted：用户点 Submit，response 为输入内容（支持多行）
-# - cancelled：用户点 Cancel 或关闭窗口
-# - timeout：到达 -Timeout 秒未操作，自动关闭
+# Called by backends/native-backend.ts via:
+#   powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -File win-feedback.ps1 -Timeout <sec>
 #
-# 注意：使用 -ExecutionPolicy Bypass 调用以绕过执行策略限制。
+# Input : message text is read from STDIN as UTF-8 (avoids the ~32K command-line
+#         length limit and codepage issues of passing text via -Message argv).
+# Output: ONE line on stdout ->  B64:<base64 of UTF-8 JSON {"status":"...","response":"..."}>
+#         The Base64 envelope is codepage-proof: Windows PowerShell writes redirected
+#         output using the legacy OEM/ANSI codepage, which corrupts raw UTF-8 JSON
+#         on non-English systems (e.g. CP936 on zh-CN Windows).
+#         status: submitted | cancelled | timeout
+#
+# Note : -ExecutionPolicy Bypass is used by the caller to run this script.
 
 param(
-    [string]$Message = "",
     [int]$Timeout = 300
 )
+
+$ErrorActionPreference = 'Stop'
+
+# ---- read message from stdin (UTF-8, BOM-tolerant) ----
+$Message = ''
+try {
+    $stdinReader = New-Object System.IO.StreamReader(
+        [Console]::OpenStandardInput(),
+        (New-Object System.Text.UTF8Encoding($false))
+    )
+    $Message = $stdinReader.ReadToEnd()
+} catch {
+    $Message = ''
+}
 
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
-# ---- 主窗体 ----
+# ---- main form ----
 $form = New-Object System.Windows.Forms.Form
-$form.Text = "Interactive Feedback"
-$form.Size = New-Object System.Drawing.Size(580, 500)
-$form.StartPosition = "CenterScreen"
-$form.FormBorderStyle = "FixedDialog"
-$form.MaximizeBox = $false
-$form.MinimizeBox = $false
-$form.TopMost = $true
+$form.Text = 'Interactive Feedback'
+$form.Size = New-Object System.Drawing.Size(600, 520)
+$form.MinimumSize = New-Object System.Drawing.Size(420, 380)
+$form.StartPosition = 'CenterScreen'
+$form.KeyPreview = $true
 
-# ---- 消息展示区（只读，自动换行）----
-$lblMessage = New-Object System.Windows.Forms.Label
-$lblMessage.Text = $Message
-$lblMessage.Location = New-Object System.Drawing.Point(15, 15)
-$lblMessage.Size = New-Object System.Drawing.Size(535, 230)
-$lblMessage.AutoSize = $false
+# ---- message area (read-only, scrollable, wraps long text) ----
+$txtMessage = New-Object System.Windows.Forms.TextBox
+$txtMessage.ReadOnly = $true
+$txtMessage.Multiline = $true
+$txtMessage.ScrollBars = 'Vertical'
+$txtMessage.WordWrap = $true
+$txtMessage.TabStop = $false
+$txtMessage.Location = New-Object System.Drawing.Point(12, 12)
+$txtMessage.Size = New-Object System.Drawing.Size(560, 240)
+$txtMessage.Anchor = 'Top,Left,Right'
+$txtMessage.BackColor = [System.Drawing.SystemColors]::Window
+$txtMessage.Text = $Message
 
-# ---- 用户输入区（多行 TextBox）----
+# ---- response area (multiline TextBox) ----
+$lblInput = New-Object System.Windows.Forms.Label
+$lblInput.Text = 'Your response:'
+$lblInput.AutoSize = $true
+$lblInput.Location = New-Object System.Drawing.Point(12, 260)
+$lblInput.Anchor = 'Top,Left,Right'
+
 $txtResponse = New-Object System.Windows.Forms.TextBox
 $txtResponse.Multiline = $true
-$txtResponse.Location = New-Object System.Drawing.Point(15, 255)
-$txtResponse.Size = New-Object System.Drawing.Size(535, 150)
-$txtResponse.ScrollBars = "Vertical"
+$txtResponse.Location = New-Object System.Drawing.Point(12, 278)
+$txtResponse.Size = New-Object System.Drawing.Size(560, 140)
+$txtResponse.ScrollBars = 'Vertical'
 $txtResponse.AcceptsReturn = $true
 $txtResponse.WordWrap = $true
+$txtResponse.MaxLength = 0
+$txtResponse.Anchor = 'Top,Left,Right,Bottom'
 
-# ---- Submit 按钮 ----
+# ---- Submit / Cancel buttons ----
 $btnSubmit = New-Object System.Windows.Forms.Button
-$btnSubmit.Text = "Submit"
-$btnSubmit.Location = New-Object System.Drawing.Point(335, 415)
-$btnSubmit.Size = New-Object System.Drawing.Size(100, 32)
+$btnSubmit.Text = 'Submit'
+$btnSubmit.Location = New-Object System.Drawing.Point(378, 428)
+$btnSubmit.Size = New-Object System.Drawing.Size(95, 30)
 $btnSubmit.DialogResult = [System.Windows.Forms.DialogResult]::OK
+$btnSubmit.Anchor = 'Bottom,Right'
 
-# ---- Cancel 按钮 ----
 $btnCancel = New-Object System.Windows.Forms.Button
-$btnCancel.Text = "Cancel"
-$btnCancel.Location = New-Object System.Drawing.Point(450, 415)
-$btnCancel.Size = New-Object System.Drawing.Size(100, 32)
+$btnCancel.Text = 'Cancel'
+$btnCancel.Location = New-Object System.Drawing.Point(479, 428)
+$btnCancel.Size = New-Object System.Drawing.Size(95, 30)
 $btnCancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+$btnCancel.Anchor = 'Bottom,Right'
 
-$form.Controls.AddRange(@($lblMessage, $txtResponse, $btnSubmit, $btnCancel))
+$form.Controls.AddRange(@($txtMessage, $lblInput, $txtResponse, $btnSubmit, $btnCancel))
 $form.AcceptButton = $btnSubmit
 $form.CancelButton = $btnCancel
 
-# ---- 状态对象（用 Form.Tag 携带，Timer 回调可安全修改）----
-$form.Tag = [PSCustomObject]@{ status = "cancelled"; response = "" }
+# ---- state object (Form.Tag carried, safe to mutate from Timer callback) ----
+$form.Tag = [PSCustomObject]@{ status = 'cancelled' }
 
-# ---- 超时定时器 ----
+# ---- timeout timer ----
 $timer = New-Object System.Windows.Forms.Timer
 $timer.Interval = $Timeout * 1000
 $timer.Add_Tick({
-    $form.Tag.status = "timeout"
+    $form.Tag.status = 'timeout'
     $form.Close()
 })
 $timer.Start()
 
-# ---- 显示对话框（阻塞）----
+# ---- keyboard: Ctrl+Enter submits (Esc is handled by CancelButton) ----
+$form.Add_KeyDown({
+    if ($_.Control -and $_.KeyCode -eq [System.Windows.Forms.Keys]::Enter) {
+        $form.DialogResult = [System.Windows.Forms.DialogResult]::OK
+        $form.Close()
+    }
+})
+
+# ---- show dialog (blocking) ----
 $dialogResult = $form.ShowDialog()
 $timer.Stop()
 
-# ---- 确定最终状态 ----
-if ($form.Tag.status -ne "timeout" -and $dialogResult -eq [System.Windows.Forms.DialogResult]::OK) {
-    $form.Tag.status = "submitted"
+# ---- resolve final status ----
+if ($form.Tag.status -ne 'timeout' -and $dialogResult -eq [System.Windows.Forms.DialogResult]::OK) {
+    $form.Tag.status = 'submitted'
 }
-$form.Tag.response = $txtResponse.Text
 
-# ---- 输出 JSON 到 stdout（单行，紧凑）----
-Write-Output ($form.Tag | ConvertTo-Json -Compress)
+$response = $txtResponse.Text
+# keep in sync with server-side MAX_RESPONSE_CHARS
+if ($response.Length -gt 1000000) {
+    $response = $response.Substring(0, 1000000)
+}
+$form.Tag | Add-Member -MemberType NoteProperty -Name response -Value $response -Force
+
+# ---- emit single-line Base64-wrapped JSON to stdout ----
+$payload = $form.Tag | ConvertTo-Json -Compress
+$bytes = [System.Text.Encoding]::UTF8.GetBytes($payload)
+[Console]::Out.Write('B64:' + [Convert]::ToBase64String($bytes) + [Environment]::NewLine)
+
+$form.Dispose()

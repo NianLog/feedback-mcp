@@ -57,11 +57,10 @@ package-lock.json
 yarn.lock
 pnpm-lock.yaml
 
-# Test files
-test/
-tests/
-**/*.test.*
-**/*.spec.*
+# Test artifacts（测试源码随仓库交付，仅忽略覆盖率/临时输出）
+coverage/
+.nyc_output/
+test/tmp/
 
 # CI/CD
 .github/
@@ -70,6 +69,9 @@ tests/
 
 # Build cache
 .cache/
+
+# Local security-scan state
+.mimosa/
 
 # Development files
 .eslintrc*

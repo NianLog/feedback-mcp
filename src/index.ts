@@ -15,59 +15,24 @@ import { z } from 'zod';
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { showDialog, type DialogOptions, type UIBackendType } from './dialog.js';
-import type { ThemeMode } from './core/types.js';
+import { showDialog } from './dialog.js';
+import { parseConfig, MAX_MESSAGE_CHARS } from './core/config.js';
+import type { Language } from './core/types.js';
 
 /**
  * 从 package.json 读取版本号，确保 MCP 握手上报的版本与发布版本一致。
  * 路径基于当前模块位置（dist/index.js 或 src/index.ts）向上回到包根。
  */
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const pkgVersion = JSON.parse(
-  readFileSync(path.join(__dirname, '..', 'package.json'), 'utf-8')
-).version as string;
-
-/**
- * 服务器配置（从环境变量解析）
- */
-interface ServerConfig {
-  /** 对话框超时（毫秒，由 FEEDBACK_TIMEOUT 秒换算） */
-  defaultTimeout: number;
-  /** 界面语言（'zh' | 'en'） */
-  language: string;
-  /** UI 后端：browser（默认，富文本）/ native（系统对话框，省内存）/ auto */
-  ui: UIBackendType;
-  /** 主题：auto（跟随系统）/ light / dark */
-  theme: ThemeMode;
-}
-
-/**
- * 解析服务器配置。
- *
- * 设计原则：不再用环境变量强制截断用户输入（FEEDBACK_MAX_TOKENS 已移除）——
- * 误伤正常的长日志/代码反而不利。token 控制交给 AI 协作（通过工具描述引导
- * AI 主动精简 message），比硬截断更合理。
- */
-function parseConfig(): ServerConfig {
-  // 超时（秒）：FEEDBACK_TIMEOUT 以秒为单位，默认 300s（5 分钟），最小 5s，非法回退 300s
-  const rawTimeout = parseInt(process.env.FEEDBACK_TIMEOUT || '300', 10);
-  const timeoutSec = Number.isFinite(rawTimeout) && rawTimeout >= 5 ? rawTimeout : 300;
-  const defaultTimeout = timeoutSec * 1000;
-
-  // 语言仅接受 'zh' | 'en'，非法值回退为 'zh'
-  const rawLang = process.env.FEEDBACK_LANGUAGE || 'zh';
-  const language = rawLang === 'en' || rawLang === 'zh' ? rawLang : 'zh';
-
-  // UI 后端：browser（默认）/ native / auto
-  const rawUi = process.env.FEEDBACK_UI || 'browser';
-  const ui: UIBackendType = rawUi === 'auto' || rawUi === 'native' ? rawUi : 'browser';
-
-  // 主题：auto（默认，跟随系统）/ light / dark
-  const rawTheme = process.env.FEEDBACK_THEME || 'auto';
-  const theme: ThemeMode = rawTheme === 'light' || rawTheme === 'dark' ? rawTheme : 'auto';
-
-  return { defaultTimeout, language, ui, theme };
-}
+const pkgVersion = (() => {
+  try {
+    return (JSON.parse(readFileSync(path.join(__dirname, '..', 'package.json'), 'utf-8')) as {
+      version?: string;
+    }).version ?? '0.0.0';
+  } catch {
+    return '0.0.0';
+  }
+})();
 
 /**
  * 主函数 - 初始化并启动 MCP 服务器
@@ -81,16 +46,18 @@ async function main() {
   });
 
   console.error('[feedback-mcp] Server starting...');
-  console.error(`[feedback-mcp] Timeout: ${config.defaultTimeout / 1000}s`);
+  console.error(`[feedback-mcp] Timeout: ${config.defaultTimeoutMs / 1000}s`);
   console.error(`[feedback-mcp] Language: ${config.language}`);
   console.error(`[feedback-mcp] UI backend: ${config.ui}`);
   console.error(`[feedback-mcp] Theme: ${config.theme}`);
+  console.error(`[feedback-mcp] Port: ${config.port === 0 ? 'random' : config.port}`);
 
   /**
    * 注册 interactive_feedback 工具。
    *
    * 工具描述刻意精简（节约 token），并提示 AI 控制 message 长度——
    * 这比用环境变量硬截断用户输入更合理（避免误伤正常的长日志/代码）。
+   * message 仅有非空 + 字符数上界的硬校验（防病态超长输入拖垮渲染）。
    */
   server.registerTool(
     'interactive_feedback',
@@ -103,43 +70,55 @@ async function main() {
       inputSchema: {
         message: z
           .string()
+          .min(1, 'message must not be empty')
+          .max(
+            MAX_MESSAGE_CHARS,
+            `message exceeds ${MAX_MESSAGE_CHARS} characters; summarize it or split into multiple turns`
+          )
           .describe('Text to show the user (Markdown supported). Keep it focused and readable.'),
       },
       outputSchema: {
         submitted: z.boolean().describe('Whether the user submitted a response'),
         response: z.string().optional().describe('User response content'),
         timedOut: z.boolean().optional().describe('Whether the dialog timed out'),
+        error: z.string().optional().describe('Error message when the dialog could not be shown'),
       },
     },
     async ({ message }) => {
       console.error('[feedback-mcp] Tool called with message length:', message.length);
 
-      const dialogOptions: DialogOptions = {
+      const result = await showDialog({
         message,
-        timeout: config.defaultTimeout,
-        language: config.language,
+        timeout: config.defaultTimeoutMs,
+        language: config.language as Language,
         ui: config.ui,
         theme: config.theme,
-      };
-
-      const result = await showDialog(dialogOptions);
+        port: config.port,
+      });
 
       console.error('[feedback-mcp] Dialog result:', {
         submitted: result.submitted,
         responseLength: result.response?.length || 0,
         timedOut: result.timedOut,
+        error: result.error,
       });
 
       const output = {
         submitted: result.submitted,
         response: result.response || '',
         timedOut: result.timedOut || false,
+        ...(result.error ? { error: result.error } : {}),
       };
 
-      // 返回简洁的文本响应（节约 token）
+      // 对话框未能展示（浏览器启动失败/原生工具缺失）必须以错误语义告知 AI，
+      // 而不是伪装成"用户取消"误导其后续决策。
       let textResponse: string;
-      if (result.submitted && result.response) {
-        textResponse = `User response: ${result.response}`;
+      let isError = false;
+      if (result.error) {
+        isError = true;
+        textResponse = `Dialog error: ${result.error}`;
+      } else if (result.submitted) {
+        textResponse = `User response: ${result.response ?? ''}`;
       } else if (result.timedOut) {
         textResponse = 'User did not respond (timeout)';
       } else {
@@ -147,8 +126,9 @@ async function main() {
       }
 
       return {
-        content: [{ type: 'text', text: textResponse }],
+        content: [{ type: 'text' as const, text: textResponse }],
         structuredContent: output,
+        isError,
       };
     }
   );

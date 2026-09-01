@@ -22,6 +22,10 @@ export const SANITIZE_OPTIONS: sanitizeHtml.IOptions = {
     img: ['src', 'alt', 'title', 'width', 'height'],
   },
   allowedSchemes: ['http', 'https', 'mailto'],
+  allowedSchemesByTag: {
+    // data: 图片与 CSP img-src 保持一致，离线小图标友好且无脚本执行面
+    img: ['http', 'https', 'data'],
+  },
   transformTags: {
     a: sanitizeHtml.simpleTransform('a', { rel: 'noopener noreferrer', target: '_blank' }),
   },
@@ -52,38 +56,58 @@ export function renderMarkdownSafe(message: string): string {
  * 标题 `#` → 文字；强调 `**`/`*`/`` ` `` → 内容；代码块围栏 → 代码体；
  * 列表 `-`/`1.` → 缩进项；链接 `[t](u)` → `t (u)`；HTML 标签去除。
  *
+ * 边界约束（避免误伤普通文本）：
+ * - `_x_` 斜体仅在单词边界处剥离（`file_name_here` 这类下划线标识符保持原样）；
+ * - HTML 标签剥离仅针对 `<` 后紧跟字母/斜杠的合法标签形态（`x < 3 and y > 2` 保持原样）。
+ *
  * @param md - Markdown 原文
  * @returns 可读纯文本
  */
 export function markdownToPlain(md: string): string {
   let text = md;
 
-  // 提取代码块（含语言标识）→ 保留代码体，前后空行
-  text = text.replace(/```[a-zA-Z0-9]*\n([\s\S]*?)```/g, (_m, code) => `\n${code}\n`);
-  // 行内代码 `x` → x
-  text = text.replace(/`([^`]+)`/g, '$1');
+  // 代码块与行内代码先提取为占位符，处理完其余语法后再回填——
+  // 否则代码内容中的 **bold**、_xx_、<tag> 会被后续规则误处理。
+  const codeSlots: string[] = [];
+  const stashCode = (code: string): string => {
+    codeSlots.push(code);
+    return `\u0000CODE${codeSlots.length - 1}\u0000`;
+  };
+
+  // 先剥 HTML 注释（含多行）
+  text = text.replace(/<!--[\s\S]*?-->/g, '');
+  // 代码块（含语言标识，兼容 CRLF 与结尾无换行）→ 占位符，前后空行
+  text = text.replace(/```[a-zA-Z0-9+-]*(?:\r?\n|$)([\s\S]*?)```/g, (_m, code: string) =>
+    `\n${stashCode(code)}\n`
+  );
+  // 行内代码 `x` → 占位符
+  text = text.replace(/`([^`\n]+)`/g, (_m, code: string) => stashCode(code));
   // 图片 ![alt](src) → alt
-  text = text.replace(/!\[([^\]]*)\]\([^)]+\)/g, '$1');
+  text = text.replace(/!\[([^\]]*)\]\([^)\s]*[^)]*\)/g, '$1');
   // 链接 [text](url) → text (url)
-  text = text.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '$1 ($2)');
-  // 标题 #/##/... → 文字（保留层级感用缩进）
+  text = text.replace(/\[([^\]]+)\]\(([^)\s]*[^)]*)\)/g, '$1 ($2)');
+  // 标题 #/##/... → 文字
   text = text.replace(/^#{1,6}\s+/gm, '');
-  // 粗体 **x** / __x__ → x
-  text = text.replace(/\*\*([^*]+)\*\*/g, '$1').replace(/__([^_]+)__/g, '$1');
-  // 斜体 *x* / _x_ → x
-  text = text.replace(/\*([^*]+)\*/g, '$1').replace(/_([^_]+)_/g, '$1');
+  // 粗体 **x** / __x__ → x（__ 仅单词边界，避免误伤下划线标识符）
+  text = text.replace(/\*\*([^*\n]+)\*\*/g, '$1');
+  text = text.replace(/(?<![\w\\])__([^_\n]+)__(?!\w)/g, '$1');
+  // 斜体 *x* / _x_ → x（_ 仅单词边界：file_name_here 不受影响）
+  text = text.replace(/\*([^*\n]+)\*/g, '$1');
+  text = text.replace(/(?<![\w\\])_([^_\n]+)_(?!\w)/g, '$1');
   // 删除线 ~~x~~ → x
-  text = text.replace(/~~([^~]+)~~/g, '$1');
+  text = text.replace(/~~([^~\n]+)~~/g, '$1');
   // 引用 > x → x
   text = text.replace(/^>\s?/gm, '');
-  // 无序列表 - / * / + → •
-  text = text.replace(/^\s*[-*+]\s+/gm, '  • ');
+  // 无序列表 - / * / + → •（仅行首、后随空白，避免误伤 "a - b"；保留原缩进）
+  text = text.replace(/^(\s*)[-*+]\s+/gm, '$1• ');
   // 有序列表 1. → 保留数字
   text = text.replace(/^(\s*)(\d+)\.\s+/gm, '$1$2. ');
-  // 水平分割线 ---/*** → ─────
-  text = text.replace(/^\s*([-*]){3,}\s*$/gm, '─────────');
-  // 去除 HTML 标签
-  text = text.replace(/<[^>]+>/g, '');
+  // 水平分割线 ---/*** → ─────（仅整行形态）
+  text = text.replace(/^\s*(?:-{3,}|\*{3,})\s*$/gm, '─────────');
+  // 去除 HTML 标签（仅 < 后紧跟字母或 </字母 的合法标签形态，避免误删 "x < 3 ... y > 2"）
+  text = text.replace(/<\/?[A-Za-z][^>]*>/g, '');
+  // 回填代码内容
+  text = text.replace(/\u0000CODE(\d+)\u0000/g, (_m, i: string) => codeSlots[Number(i)] ?? '');
   // 压缩连续空行（最多保留一个空行）
   text = text.replace(/\n{3,}/g, '\n\n').trim();
 
