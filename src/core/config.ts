@@ -57,7 +57,14 @@ function clamp(n: number, min: number, max: number): number {
  */
 export function parseConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
   // 超时（秒）：非法回退 300；合法值钳制到 [5, 86400]
-  const timeoutSec = clamp(toInt(env.FEEDBACK_TIMEOUT) ?? DEFAULT_TIMEOUT_SEC, MIN_TIMEOUT_SEC, MAX_TIMEOUT_SEC);
+  const parsedTimeoutSec = toInt(env.FEEDBACK_TIMEOUT);
+  const timeoutSec = clamp(parsedTimeoutSec ?? DEFAULT_TIMEOUT_SEC, MIN_TIMEOUT_SEC, MAX_TIMEOUT_SEC);
+  if (env.FEEDBACK_TIMEOUT !== undefined && parsedTimeoutSec !== timeoutSec) {
+    console.error(`[feedback-mcp] FEEDBACK_TIMEOUT uses seconds (5-86400); effective timeout: ${timeoutSec}s. Use 600 for 10 minutes.`);
+  }
+  if (env.FEEDBACK_MAX_TOKENS !== undefined) {
+    console.error('[feedback-mcp] FEEDBACK_MAX_TOKENS was removed in v2.1 and is ignored; message limit is 1,000,000 characters.');
+  }
 
   // 语言仅接受 'zh' | 'en'，非法值回退为 'zh'
   const language: 'zh' | 'en' = env.FEEDBACK_LANGUAGE === 'en' ? 'en' : 'zh';

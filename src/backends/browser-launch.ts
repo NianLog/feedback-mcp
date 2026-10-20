@@ -173,14 +173,23 @@ async function launchDetectedBrowser(browserPath: string, url: string): Promise<
  * @param url - 对话框页面 URL
  * @returns 描述实际使用的浏览器（用于日志/测试），失败时 reject
  */
-export async function launchBrowserForUrl(url: string): Promise<string> {
+export async function launchBrowserForUrl(url: string, signal?: AbortSignal): Promise<string> {
+  signal?.throwIfAborted();
   const browserPath = await findBrowserPath();
+  signal?.throwIfAborted();
 
   if (browserPath && (await launchDetectedBrowser(browserPath, url))) {
     return `browser: ${browserPath}`;
   }
 
   console.error('[feedback-mcp] Using system default browser as fallback');
-  await open(url);
+  signal?.throwIfAborted();
+  const child = await open(url);
+  await new Promise<void>((resolve, reject) => {
+    child.once('error', reject);
+    // open 返回时 spawn 事件可能已发生；成功创建的进程已有 PID。
+    if (child.pid) resolve();
+    else child.once('spawn', () => resolve());
+  });
   return 'system default browser';
 }

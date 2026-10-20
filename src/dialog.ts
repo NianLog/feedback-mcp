@@ -64,6 +64,8 @@ export class DialogRouter {
 
   /** 展示对话框（并发调用将按 FIFO 排队） */
   show(options: DialogOptions): Promise<DialogResult> {
+    const signal = options.signal;
+    if (signal?.aborted) return Promise.resolve({ submitted: false });
     if (this.activeCount > 0) {
       console.error(`[feedback-mcp] A dialog is already active, queueing (waiting: ${this.activeCount})`);
     }
@@ -73,13 +75,21 @@ export class DialogRouter {
       () => undefined,
       () => undefined
     );
-    return task;
+    if (!signal) return task;
+    let onAbort!: () => void;
+    const cancelled = new Promise<DialogResult>((resolve) => {
+      onAbort = () => resolve({ submitted: false });
+      signal.addEventListener('abort', onAbort, { once: true });
+    });
+    return Promise.race([task, cancelled]).finally(() => signal.removeEventListener('abort', onAbort));
   }
 
   private async runOne(options: DialogOptions): Promise<DialogResult> {
+    if (options.signal?.aborted) return { submitted: false };
     this.activeCount++;
     try {
       const backend = await this.selectBackend(options.ui);
+      if (options.signal?.aborted) return { submitted: false };
       let result: DialogResult;
       try {
         result = await backend.show(options);

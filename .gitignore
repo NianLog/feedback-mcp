@@ -52,8 +52,10 @@ docs/
 !README_EN.md
 !assets/
 
+# Local engineering notes and indexes
+.agents/
+
 # Package managers
-package-lock.json
 yarn.lock
 pnpm-lock.yaml
 
@@ -63,7 +65,6 @@ coverage/
 test/tmp/
 
 # CI/CD
-.github/
 .gitlab-ci.yml
 .travis.yml
 

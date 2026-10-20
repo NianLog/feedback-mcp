@@ -9,7 +9,12 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
-import { parsePowerShellResult } from '../src/backends/native-backend.js';
+import childProcess from 'node:child_process';
+import { syncBuiltinESMExports } from 'node:module';
+import { once } from 'node:events';
+import { NativeBackend, parsePowerShellResult } from '../src/backends/native-backend.js';
+import { DialogRouter } from '../src/dialog.js';
+import { MAX_RESPONSE_CHARS, RESPONSE_TRUNCATION_MARKER } from '../src/core/config.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PS1_PATH = path.resolve(__dirname, '..', 'assets', 'native', 'win-feedback.ps1');
@@ -51,6 +56,60 @@ test('解析：畸形输入返回 null', () => {
   assert.equal(parsePowerShellResult('B64:!!!not-base64'), null);
   assert.equal(parsePowerShellResult('B64:' + Buffer.from('not json').toString('base64')), null);
   assert.equal(parsePowerShellResult(JSON.stringify({ status: 'weird' })), null);
+  assert.equal(parsePowerShellResult(b64Envelope(null)), null);
+});
+
+test('native：异常退出、正常取消与中文响应保持不同语义', async (t) => {
+  const originalSpawn = childProcess.spawn;
+  const descriptor = Object.getOwnPropertyDescriptor(process, 'platform')!;
+  let script = '';
+  t.mock.method(childProcess, 'spawn', ((_command: string, _args: string[], options: object) =>
+    originalSpawn(process.execPath, ['-e', script], options)) as typeof childProcess.spawn);
+  syncBuiltinESMExports();
+  try {
+    for (const scenario of [
+      { os: 'linux', code: 255, output: '', error: true },
+      { os: 'linux', code: 1, output: '', error: false },
+      { os: 'darwin', code: 1, output: '', error: true },
+      { os: 'darwin', code: 0, output: 'cancelled\n', error: false },
+      { os: 'darwin', code: 0, output: 'submitted\r中文回复\n', response: '中文回复' },
+    ]) {
+      Object.defineProperty(process, 'platform', { ...descriptor, value: scenario.os });
+      script = `process.stdin.resume(); process.stdin.on('end', () => { process.stdout.write(${JSON.stringify(scenario.output)}); process.exitCode = ${scenario.code}; });`;
+      const result = await new NativeBackend().show({ message: 'audit', language: 'zh', timeout: 2000 });
+      if (scenario.response) assert.deepEqual(result, { submitted: true, response: scenario.response });
+      else if (scenario.error) assert.ok(result.error, `${scenario.os}/${scenario.code} must be an error`);
+      else assert.deepEqual(result, { submitted: false });
+    }
+  } finally {
+    Object.defineProperty(process, 'platform', descriptor);
+    t.mock.restoreAll(); syncBuiltinESMExports();
+  }
+});
+
+test('native：调用取消会终止真实子进程并返回取消结果', async (t) => {
+  const originalSpawn = childProcess.spawn;
+  let child!: ReturnType<typeof spawn>;
+  let started!: () => void;
+  const spawned = new Promise<void>(resolve => { started = resolve; });
+  t.mock.method(childProcess, 'spawn', ((_command: string, _args: string[], options: object) => {
+    child = originalSpawn(process.execPath, ['-e', 'process.stdin.resume(); setInterval(() => {}, 1000)'], options);
+    started();
+    return child;
+  }) as typeof childProcess.spawn);
+  syncBuiltinESMExports();
+  try {
+    const controller = new AbortController();
+    const result = new NativeBackend().show({ message: 'cancel', language: 'zh', timeout: 2000, signal: controller.signal });
+    await spawned;
+    const closed = once(child, 'close');
+    controller.abort();
+    assert.deepEqual(await result, { submitted: false });
+    await closed;
+    assert.equal(child.killed, true);
+  } finally {
+    child?.kill(); t.mock.restoreAll(); syncBuiltinESMExports();
+  }
 });
 
 test('ps1 脚本随包存在', () => {
@@ -103,4 +162,21 @@ function psAvailable(): boolean {
   assert.match(result.stdout, /^B64:[A-Za-z0-9+/=]+/);
   const decoded = Buffer.from(result.stdout.trim().slice(4), 'base64').toString('utf8');
   assert.equal(decoded, message, 'Chinese text must round-trip through PowerShell without mojibake');
+});
+
+;(onWindows ? test : test.skip)('Windows：实际输出处理截断后，路由只返回一个显式截断标记', async () => {
+  const source = fs.readFileSync(PS1_PATH, 'utf8');
+  const outputBlock = source.slice(source.indexOf('$response = $txtResponse.Text'), source.indexOf('$form.Dispose()'));
+  const script = "$txtResponse = [PSCustomObject]@{ Text = ('x' * 1000001) }; $form = [PSCustomObject]@{ Tag = [PSCustomObject]@{ status = 'submitted' } }; " + outputBlock;
+  const output = await new Promise<string>((resolve, reject) => {
+    const child = spawn('powershell.exe', ['-NoProfile', '-Command', script], { windowsHide: true });
+    const chunks: Buffer[] = [];
+    child.stdout.on('data', (chunk: Buffer) => chunks.push(chunk));
+    child.on('error', reject);
+    child.on('close', (code) => code === 0 ? resolve(Buffer.concat(chunks).toString()) : reject(new Error(`PowerShell exited ${code}`)));
+  });
+  const parsed = parsePowerShellResult(output)!;
+  const router = new DialogRouter(async () => ({ isAvailable: async () => true, show: async () => parsed }));
+  const result = await router.show({ message: 'm', language: 'zh' });
+  assert.equal(result.response, 'x'.repeat(MAX_RESPONSE_CHARS) + RESPONSE_TRUNCATION_MARKER);
 });

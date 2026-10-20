@@ -21,7 +21,7 @@
 import { spawn } from 'node:child_process';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { markdownToPlain } from '../core/markdown.js';
+import { markdownToPlainInWorker } from '../core/markdown-render.js';
 import type { UIBackend, DialogOptions, DialogResult } from '../core/types.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -47,8 +47,8 @@ function commandExists(cmd: string): Promise<boolean> {
 
   return new Promise((resolve) => {
     const check = process.platform === 'win32'
-      ? spawn('where', [cmd], { stdio: 'ignore' })
-      : spawn('which', [cmd], { stdio: 'ignore' });
+      ? spawn('where', [cmd], { stdio: 'ignore', windowsHide: true })
+      : spawn('which', [cmd], { stdio: 'ignore', windowsHide: true });
 
     const done = (ok: boolean) => {
       availabilityCache.set(cacheKey, ok);
@@ -85,6 +85,7 @@ export function parsePowerShellResult(raw: string): DialogResult | null {
     return null;
   }
 
+  if (!json || typeof json !== 'object') return null;
   const obj = json as { status?: unknown; response?: unknown };
   if (obj.status === 'submitted') {
     return {
@@ -107,13 +108,13 @@ export function parsePowerShellResult(raw: string): DialogResult | null {
  * - stdin 传入 message 作为初始内容（`--text-info` 从 stdin 读）。
  * - exit 0 = 提交（stdout=输入），1 = 取消，null（被 kill）= 超时。
  */
-function showZenity(message: string, timeoutMs: number): Promise<DialogResult> {
+function showZenity(message: string, timeoutMs: number, signal?: AbortSignal): Promise<DialogResult> {
   return new Promise((resolve) => {
     const child = spawn('zenity', [
       '--text-info', '--editable',
       '--title=Interactive Feedback',
       '--width=600', '--height=450',
-    ], { stdio: ['pipe', 'pipe', 'inherit'] });
+    ], { stdio: ['pipe', 'pipe', 'inherit'], windowsHide: true });
 
     const chunks: Buffer[] = [];
     let outputBytes = 0;
@@ -124,7 +125,12 @@ function showZenity(message: string, timeoutMs: number): Promise<DialogResult> {
       if (settled) return;
       settled = true;
       if (timer) clearTimeout(timer);
+      signal?.removeEventListener('abort', onAbort);
       resolve(r);
+    };
+    const onAbort = () => {
+      child.kill();
+      finish({ submitted: false });
     };
 
     child.stdout.on('data', (d: Buffer) => {
@@ -150,12 +156,14 @@ function showZenity(message: string, timeoutMs: number): Promise<DialogResult> {
       finish({ submitted: false, timedOut: true });
     }, timeoutMs);
 
-    child.on('exit', (code) => {
+    child.on('close', (code, exitSignal) => {
       const out = Buffer.concat(chunks).toString('utf8');
       if (code === 0) finish({ submitted: true, response: out.replace(/\s+$/, '') });
-      else if (code === null) finish({ submitted: false, timedOut: true });
-      else finish({ submitted: false });
+      else if (code === 1) finish({ submitted: false });
+      else finish({ submitted: false, error: `zenity exited with ${exitSignal ?? code}` });
     });
+    signal?.addEventListener('abort', onAbort, { once: true });
+    if (signal?.aborted) onAbort();
   });
 }
 
@@ -163,11 +171,11 @@ function showZenity(message: string, timeoutMs: number): Promise<DialogResult> {
  * macOS：osascript display dialog（单行输入）。
  *
  * - prompt 通过 stdin → `do shell script "cat"` 读入，避免 AppleScript 转义难题。
- * - 用户取消 → AppleScript 错误 -128（非零退出）；超时 → Node kill（exit null）。
+ * - 用户取消 → 脚本捕获 -128 并输出 cancelled；其他非零退出是程序错误。
  * - AppleScript 的 `return` 常量是 CR：输出形态为 `submitted\r<response>`，
  *   剥离标记后需同时兼容 CR/LF。
  */
-function showOsascript(message: string, timeoutMs: number): Promise<DialogResult> {
+function showOsascript(message: string, timeoutMs: number, signal?: AbortSignal): Promise<DialogResult> {
   return new Promise((resolve) => {
     const script = [
       'set promptText to (do shell script "cat")',
@@ -190,7 +198,12 @@ function showOsascript(message: string, timeoutMs: number): Promise<DialogResult
       if (settled) return;
       settled = true;
       if (timer) clearTimeout(timer);
+      signal?.removeEventListener('abort', onAbort);
       resolve(r);
+    };
+    const onAbort = () => {
+      child.kill();
+      finish({ submitted: false });
     };
 
     child.stdout.on('data', (d: Buffer) => {
@@ -215,20 +228,22 @@ function showOsascript(message: string, timeoutMs: number): Promise<DialogResult
       finish({ submitted: false, timedOut: true });
     }, timeoutMs);
 
-    child.on('exit', (code) => {
+    child.on('close', (code, exitSignal) => {
       const out = Buffer.concat(chunks).toString('utf8');
-      if (out.startsWith('submitted')) {
+      if (code === 0 && /^submitted[\r\n]/.test(out)) {
         const response = out
           .slice('submitted'.length)
           .replace(/^[\r\n]+/, '')
           .replace(/\s+$/, '');
         finish({ submitted: true, response });
-      } else if (code === null) {
-        finish({ submitted: false, timedOut: true });
-      } else {
+      } else if (code === 0 && out.trim() === 'cancelled') {
         finish({ submitted: false });
+      } else {
+        finish({ submitted: false, error: `osascript failed (${exitSignal ?? code}): unexpected dialog output` });
       }
     });
+    signal?.addEventListener('abort', onAbort, { once: true });
+    if (signal?.aborted) onAbort();
   });
 }
 
@@ -239,7 +254,7 @@ function showOsascript(message: string, timeoutMs: number): Promise<DialogResult
  * - ps1 脚本内 Timer 自超时；Node 侧另设看门狗（超时 + 宽限）防脚本挂起卡死工具调用。
  * - 输出为 `B64:<base64(UTF-8 JSON)>`，编码无关地跨代码页传输。
  */
-function showPowerShell(message: string, timeoutMs: number, timeoutSec: number): Promise<DialogResult> {
+function showPowerShell(message: string, timeoutMs: number, timeoutSec: number, signal?: AbortSignal): Promise<DialogResult> {
   return new Promise((resolve) => {
     const ps1 = path.join(__dirname, '..', '..', 'assets', 'native', 'win-feedback.ps1');
     const child = spawn('powershell.exe', [
@@ -248,9 +263,10 @@ function showPowerShell(message: string, timeoutMs: number, timeoutSec: number):
       '-STA',
       '-File', ps1,
       '-Timeout', String(timeoutSec),
-    ], { stdio: ['pipe', 'pipe', 'inherit'] });
+    ], { stdio: ['pipe', 'pipe', 'inherit'], windowsHide: true });
 
     const chunks: Buffer[] = [];
+    let outputBytes = 0;
     let settled = false;
     let watchdog: NodeJS.Timeout | undefined;
 
@@ -258,10 +274,23 @@ function showPowerShell(message: string, timeoutMs: number, timeoutSec: number):
       if (settled) return;
       settled = true;
       if (watchdog) clearTimeout(watchdog);
+      signal?.removeEventListener('abort', onAbort);
       resolve(r);
     };
+    const onAbort = () => {
+      child.kill();
+      finish({ submitted: false });
+    };
 
-    child.stdout.on('data', (d: Buffer) => chunks.push(d));
+    child.stdout.on('data', (d: Buffer) => {
+      outputBytes += d.length;
+      if (outputBytes > MAX_OUTPUT_BYTES) {
+        child.kill();
+        finish({ submitted: false, error: 'powershell output exceeded limit' });
+        return;
+      }
+      chunks.push(d);
+    });
 
     child.stdin.on('error', (err) => {
       console.error('[feedback-mcp] powershell stdin error (ignored):', err.message);
@@ -279,9 +308,9 @@ function showPowerShell(message: string, timeoutMs: number, timeoutSec: number):
       finish({ submitted: false, timedOut: true, error: 'native dialog process hung and was terminated' });
     }, timeoutMs + PS_WATCHDOG_GRACE_MS);
 
-    child.on('exit', () => {
+    child.on('close', (code) => {
       const out = Buffer.concat(chunks).toString('utf8');
-      const result = parsePowerShellResult(out);
+      const result = code === 0 ? parsePowerShellResult(out) : null;
       finish(
         result ?? {
           submitted: false,
@@ -289,6 +318,8 @@ function showPowerShell(message: string, timeoutMs: number, timeoutSec: number):
         }
       );
     });
+    signal?.addEventListener('abort', onAbort, { once: true });
+    if (signal?.aborted) onAbort();
   });
 }
 
@@ -308,14 +339,18 @@ export class NativeBackend implements UIBackend {
 
   /** 展示原生对话框并收集用户响应 */
   async show(options: DialogOptions): Promise<DialogResult> {
+    if (options.signal?.aborted) return { submitted: false };
     const timeoutMs = options.timeout || 300000;
     const timeoutSec = Math.max(5, Math.floor(timeoutMs / 1000));
-    const message = markdownToPlain(options.message);
+    const converted = await markdownToPlainInWorker(options.message, options.signal);
+    if (options.signal?.aborted) return { submitted: false };
+    if (converted.fallback) console.error('[feedback-mcp] Native Markdown conversion fell back; using original text');
+    const message = converted.text;
 
     try {
-      if (process.platform === 'linux') return await showZenity(message, timeoutMs);
-      if (process.platform === 'darwin') return await showOsascript(message, timeoutMs);
-      if (process.platform === 'win32') return await showPowerShell(message, timeoutMs, timeoutSec);
+      if (process.platform === 'linux') return await showZenity(message, timeoutMs, options.signal);
+      if (process.platform === 'darwin') return await showOsascript(message, timeoutMs, options.signal);
+      if (process.platform === 'win32') return await showPowerShell(message, timeoutMs, timeoutSec, options.signal);
       return { submitted: false, error: `native UI is not supported on platform ${process.platform}` };
     } catch (error) {
       console.error('[feedback-mcp] Native backend error:', error);

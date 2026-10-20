@@ -115,3 +115,42 @@ test('前序失败不阻塞后续对话框', async () => {
   const second = await router.show({ message: '2', language: 'zh' });
   assert.deepEqual(second, { submitted: true, response: 'ok' });
 });
+
+test('排队请求取消后立即返回，轮到它时不会启动后端', async () => {
+  let release!: (result: DialogResult) => void;
+  const shown: string[] = [];
+  const backend: UIBackend = {
+    isAvailable: async () => true,
+    show: (options) => {
+      shown.push(options.message);
+      return new Promise((resolve) => { release = resolve; });
+    },
+  };
+  const router = new DialogRouter(async () => backend);
+  const first = router.show({ message: 'first', language: 'zh' });
+  await new Promise((resolve) => setImmediate(resolve));
+  const controller = new AbortController();
+  const second = router.show({ message: 'cancelled', language: 'zh', signal: controller.signal });
+  controller.abort();
+  const result = await Promise.race([
+    second,
+    new Promise((resolve) => setTimeout(() => resolve('still waiting'), 100)),
+  ]);
+  release({ submitted: true, response: 'first' });
+  await first;
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(result, { submitted: false });
+  assert.deepEqual(shown, ['first']);
+});
+
+test('已经取消的调用不会探测或启动后端', async () => {
+  const controller = new AbortController();
+  controller.abort();
+  let selected = false;
+  const router = new DialogRouter(async () => {
+    selected = true;
+    throw new Error('must not select');
+  });
+  assert.deepEqual(await router.show({ message: 'm', language: 'zh', signal: controller.signal }), { submitted: false });
+  assert.equal(selected, false);
+});

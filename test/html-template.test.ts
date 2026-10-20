@@ -4,9 +4,29 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import vm from 'node:vm';
 import { generateHTML, generateFinalHTML, jsonForInlineScript, CSP_HEADER } from '../src/core/html-template.js';
 
 const BASE = { timeout: 300_000 } as const;
+
+test('CVE-2024-53382：离线 Prism 不把 DOM 覆盖的图片当作当前脚本', () => {
+  const source = readFileSync(new URL('../assets/prism/prism.js', import.meta.url), 'utf8');
+  for (const tagName of ['IMG', 'SCRIPT']) {
+    const script = { tagName, src: tagName === 'IMG' ? 'https://untrusted.example/prism.js' : '/prism/prism.js', hasAttribute: () => false };
+    const context: any = { document: { currentScript: script, querySelector: () => null, getElementsByTagName: () => [] },
+      Element: class { matches() { return false; } }, Prism: { manual: true } };
+    context.window = context;
+    vm.runInNewContext(source, context, { timeout: 1000 });
+    if (tagName === 'IMG') {
+      assert.equal(context.Prism.util.currentScript(), null);
+      assert.notEqual(context.Prism.filename, script.src);
+    } else {
+      assert.equal(context.Prism.util.currentScript(), script);
+      assert.equal(context.Prism.filename, script.src);
+    }
+  }
+});
 
 test('jsonForInlineScript：`</script>` 被转义为 \\u003c 序列', () => {
   const encoded = jsonForInlineScript('</script><script>alert(1)</script>');

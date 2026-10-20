@@ -1,4 +1,4 @@
-# feedback-mcp-server v2.2.0
+# feedback-mcp-server v3.0.0
 
 一个轻量级的 MCP (Model Context Protocol) 服务器，提供基于浏览器的交互式用户反馈功能，支持完整的 Markdown 渲染和语法高亮。
 
@@ -24,7 +24,7 @@
 - ✅ **并发安全**：多个对话框调用自动排队串行展示，互不冲突
 - ✅ **智能复制**：支持复制为纯文本或 Markdown 格式
 - ✅ **多语言界面**：中文和英文界面切换
-- ✅ **超时控制**：可配置超时时间，自动关闭；超时与主动取消语义分离，便于 AI 准确判断
+- ✅ **超时控制**：可配置超时时间；超时与主动取消语义分离，提前结束时保留未提交草稿
 - ✅ **多浏览器支持**：Chrome / Edge（App 模式）、Firefox / Safari（普通窗口）
 - ✅ **跨平台支持**：Windows、macOS 和 Linux
 
@@ -32,14 +32,16 @@
 
 ### 方式 1：使用 npx（推荐）
 
-无需安装，直接在 Claude Desktop 中使用：
+无需预先安装，可直接在 Claude Desktop 中使用。以下示例固定为 `3.0.0`，升级时请先验收再修改版本；`@latest` 会随新版本发布而变化。
+
+**从 2.x 升级**：先确认 Node.js ≥ 22.12.0，再重启 MCP 服务。旧 MCP 客户端、`interactive_feedback` 参数和返回字段保持兼容。`FEEDBACK_TIMEOUT` 使用秒，10 分钟填 `600`；客户端还需单独配置工具等待预算，见下文。
 
 ```json
 {
   "mcpServers": {
     "feedback": {
       "command": "npx",
-      "args": ["-y", "feedback-mcp-server@latest"],
+      "args": ["-y", "feedback-mcp-server@3.0.0"],
       "env": {
         "FEEDBACK_TIMEOUT": "300",
         "FEEDBACK_LANGUAGE": "zh",
@@ -53,7 +55,7 @@
 ### 方式 2：全局安装
 
 ```bash
-npm install -g feedback-mcp-server@latest
+npm install -g feedback-mcp-server@3.0.0
 ```
 
 配置：
@@ -80,10 +82,63 @@ npm install -g feedback-mcp-server@latest
 | 环境变量 | 描述 | 默认值 |
 |---------|------|--------|
 | `FEEDBACK_TIMEOUT` | 对话框超时（秒），非法回退 300，合法值钳制到 [5, 86400]（1 天） | 300 (5 min) |
-| `FEEDBACK_LANGUAGE` | 界面语言（仅支持 `zh` / `en`，非法值回退 `zh`） | zh |
-| `FEEDBACK_UI` | UI 后端（选填）：`browser`（富文本）/ `native`（系统对话框，约10MB）/ `auto`（优先 native，不可用回退 browser） | browser |
-| `FEEDBACK_THEME` | 主题（选填）：`auto`（跟随系统）/ `light` / `dark`；手动切换会记忆覆盖 | auto |
+| `FEEDBACK_LANGUAGE` | browser 界面语言（`zh` / `en`，非法值回退 `zh`）；不控制 AI 回复语言；native 标签使用英文 | zh |
+| `FEEDBACK_UI` | UI 后端：`browser`（富文本）/ `native`（系统对话框）/ `auto`（检测 native 工具存在，缺失时回退 browser）；native 需要图形会话 | browser |
+| `FEEDBACK_THEME` | browser 主题：`auto`（跟随系统）/ `light` / `dark`；保存的手动主题优先，native 使用系统样式 | auto |
 | `FEEDBACK_PORT` | browser 后端监听端口（选填）：`0` 随机（默认）；设固定端口（如 `17841`）可让主题偏好跨会话记忆 | 0（随机） |
+
+配置在 MCP 服务器进程启动时读取，修改后需重启该服务。v2.1 已将 `FEEDBACK_TIMEOUT` 从毫秒改为秒：10 分钟填 `600`，旧值 `600000` 会被限制为 86400 秒。已移除的 `FEEDBACK_MAX_TOKENS` 不再限制消息或模型输出；旧参数和异常超时会在 stderr 提示，日志不打印原始配置值。
+
+### 客户端等待预算
+
+`FEEDBACK_TIMEOUT` 控制弹窗，客户端另有启动和工具调用超时。客户端更早取消时，服务器结束当前会话。弹窗超时不含队列等待，客户端预算须覆盖排队、处理和收尾。下面的 660 秒是单次 10 分钟交互的示例，并发排队需另估预算。
+
+Codex 的配置文件为 `~/.codex/config.toml`。以下配置使用 npm 固定版本。桌面应用需能找到 `npx`；如使用源码构建，先 `npm ci --ignore-scripts && npm run build`，再把启动命令改为 Node 可执行文件绝对路径，参数改为 `dist/index.js` 的绝对路径。
+
+```toml
+[mcp_servers.feedback]
+command = "npx"
+args = ["-y", "feedback-mcp-server@3.0.0"]
+enabled = true
+startup_timeout_sec = 60
+tool_timeout_sec = 660
+
+[mcp_servers.feedback.env]
+FEEDBACK_TIMEOUT = "600"
+FEEDBACK_LANGUAGE = "zh"
+FEEDBACK_THEME = "auto"
+```
+
+ZCode 使用 `~/.zcode/cli/config.json` 中的 `mcp.servers`，工具预算字段是毫秒单位的 `timeoutMs`。它导入其他 Agent 配置后保存自己的副本；后续修改原配置不能代替修改 ZCode 配置。
+
+```json
+{
+  "mcp": {
+    "servers": {
+      "feedback": {
+        "type": "stdio",
+        "command": "npx",
+        "args": ["-y", "feedback-mcp-server@3.0.0"],
+        "enabled": true,
+        "timeoutMs": 660000,
+        "env": {
+          "FEEDBACK_TIMEOUT": "600",
+          "FEEDBACK_LANGUAGE": "zh",
+          "FEEDBACK_THEME": "auto"
+        }
+      }
+    }
+  }
+}
+```
+
+Claude Code 的 `MCP_TIMEOUT` 是启动预算，`MCP_TOOL_TIMEOUT` 是工具预算，均使用毫秒，应配置在 Claude Code 的宿主环境或其支持的服务级超时字段中。把它们写入 feedback 的 `env` 只能传给子进程，不能修改父客户端的预算。
+
+Codex 返回 `Script running with cell ID ...` 代表包装执行仍在运行。Agent 应继续等待同一调用，直到实际完成、明确取消或真实超时；分段返回不能作为终止、重复打开弹窗或默认审批的依据。该规则能提示 Agent 正确等待，服务器无法强制宿主继续等待。排查“不到 60 秒就结束”时，核对该次调用的版本、有效超时、`exec/wait`、取消和返回记录，分别判断。
+
+浏览器在客户端取消、超时或其他窗口提交后保留尚未提交的草稿，提示复制后手动关闭；用户主动点击取消仍按原流程结束。网络故障或结果未知时先核对原会话，不自动重发回复。
+
+客户端字段依据：[Codex MCP](https://developers.openai.com/codex/mcp/)、[ZCode MCP](https://github.com/zai-org/ZCode/blob/main/apps/zcode-cli/docs/usage/07-mcp.md)、[Claude Code 环境变量](https://code.claude.com/docs/en/env-vars)。
 
 **推荐配置：**
 ```json
@@ -124,8 +179,11 @@ AI 会自动调用 `interactive_feedback` 工具，浏览器会打开对话框�
 - **XSS 纵深防御**：sanitize-html 白名单净化 + CSP + nosniff + `X-Frame-Options: DENY` + 内嵌 JSON 的 `</script>` 转义
 - **本地服务加固**：仅绑定 `127.0.0.1`；`/submit` `/cancel` `/timeout` 需携带页面持有的随机会话令牌（防本机其他网页跨站伪造）；Host 头白名单（防 DNS rebinding）；Prism 静态资源路径遍历防护
 - **进程稳定性**：子进程 stdin/stdout 异常全部兜底（用户秒关对话框不再可能击穿服务器）；HTTP 服务结束后彻底销毁连接，无端口/句柄泄漏
-- **窗口生命周期**：对话框结束（提交/取消/超时）后窗口自动关闭；因浏览器冷启动慢而"晚到"的窗口会收到"会话已结束"收尾页并自行关闭，不会停留在加载失败错误页
+- **窗口生命周期**：本窗口提交成功或用户主动取消后尝试自动关闭；客户端取消、超时或其他窗口提交时保留未提交草稿，供用户复制后手动关闭。冷启动后晚到的窗口显示"会话已结束"收尾页
 - **并发**：并发的工具调用按 FIFO 排队，一次只展示一个对话框
+- **调用取消**：MCP 客户端取消后，排队请求不再弹窗；活动后端收到取消信号，浏览器通过本机会话事件流显示终态
+- **结果确认**：页面以本次提交的服务端确认判定成功；过期提交和网络故障保留回复内容，提示先核对结果，不自动重试
+- **固定端口复用**：下一次监听等待旧服务关闭，保留晚到窗口收尾页；冷启动时等待最长仍为 30 秒
 
 ## 🎨 界面特性
 
@@ -155,23 +213,41 @@ AI 会自动调用 `interactive_feedback` 工具，浏览器会打开对话框�
 ## 🛠️ 技术栈
 
 - **Node.js** + **TypeScript**
-- **MCP SDK**：@modelcontextprotocol/sdk
+- **MCP SDK**：@modelcontextprotocol/server v2，兼容旧握手与 2026-07-28 协议
 - **Markdown 渲染**：marked + Prism.js（本地化，离线可用）
 - **安全净化**：sanitize-html（剥离脚本/事件属性，防止 XSS）
 
 ## 🧪 开发与测试
 
 ```bash
-npm install
+npm ci --ignore-scripts
+npm run check      # TypeScript 类型检查
 npm run build      # TypeScript 编译到 dist/
-npm test           # 单元 + 集成测试（71 项，含 HTTP 协议/安全/资源释放）
+npm test           # 单元、HTTP、页面逻辑、原生进程和真实 MCP 协议回归
+npm run test:package # 临时安装 tarball，验证入口、离线资源和 MCP 反馈链路
 npm run test:e2e   # 端到端冒烟（真实 MCP 握手 + 真实窗口，会短暂弹窗）
 ```
 
+安装时关闭依赖生命周期脚本，根项目构建和测试由上述命令显式执行。`npm pack` 会自动运行 `prepack`，重新编译并检查包文件。`test:package` 清理自己创建的临时目录，把验证通过的同一份 tarball 保留在 Git 忽略的 `tmp/feedback-release/`；手动发布流程直接使用这份文件，不重新打包。
+
+GitHub Actions 配置覆盖 Windows/macOS/Linux 与 Node.js 22.12.0、24 LTS。`Publish` 等待六组验证全部通过，仅能手动运行，要求选定与 `package.json` 一致的 `vX.Y.Z` tag；需先在 GitHub 配置 `npm-publish` environment 的审批规则，并在 npm 绑定此仓库、`publish.yml` 和该 environment 的 trusted publisher，启用直接 `npm publish` 的权限。CI 发布使用 OIDC、provenance 和 CycloneDX SBOM，不保存长期 npm token；发布文件按当前版本精确选取，避免混入旧 tarball。
+
+lockfile 固定源码构建的依赖树；npm 消费者安装仍遵循包声明的依赖解析规则。CI 配置、真实 GUI 和 npm 发布状态需要分别验收。
+
+SBOM 包含构建依赖树，以覆盖作为开发依赖安装、但以离线资源进入运行包的 Prism；打包时检查离线核心与 lockfile 安装版本一致。
+
+浏览器消息保留 1,000,000 字符上限。每个会话只运行一次独立 Worker 渲染，预算 2 秒、HTML 输出上限 10 MiB、V8 old-generation 堆上限 128 MiB；超时、异常或超限显示完整转义原文，并保留复制和回复。单段超过 20,000 字符或超出整页 50,000 字符高亮预算的代码保留原文并跳过高亮。
+
+native 纯文本转换复用同一 Worker 预算和取消机制；超预算或异常时直接显示完整原文，不降低 1M 字符上限。转换期间取消不会继续打开原生窗口，队列等待旧线程退出后再处理下一条。默认浏览器启动器的异步进程错误会返回本次调用的 error，MCP 连接继续可用。
+
+HTTP(S) 图片默认显示域名、替代文字和逐张加载按钮，不自动请求外部地址。点击会向目标网站发送请求，暴露网络地址和访问时间；加载失败后由用户决定是否重试。data: 与包内图片保持直接显示。此策略允许手动加载，CSP 仍允许 HTTP(S) 图片，不构成严格离线网络限制。
+
+运行时使用 SDK v2 的 `serveStdio` 同时服务新旧协议。回归保留真实 SDK v1 客户端，覆盖 2024-11-05、2025-11-25 旧握手及 2026-07-28 discover；工具名称、消息参数、回复字段和取消语义保持兼容。v1 SDK 只用于测试，不进入运行时依赖。
+
 ## 📋 系统要求
 
-- **Node.js** >= 18.2.0
-- **操作系统**：Windows 10+ / macOS 10.15+ / Linux
+- **Node.js** >= 22.12.0，生产建议使用受支持的 Node.js 24 LTS 补丁版本
+- **操作系统**：Windows / macOS / Linux，需满足所选 Node.js 版本的[官方平台要求](https://github.com/nodejs/node/blob/v24.x/BUILDING.md#platform-list)；Node.js 24 的 macOS 最低要求为 13.5
 - **浏览器**：Chrome 或 Edge（推荐，App 模式）；Firefox / Safari 亦支持（普通窗口模式）
 - **native 后端**：Windows 需 PowerShell（系统自带）；Linux 需 zenity；macOS 使用系统自带 osascript
 
@@ -197,6 +273,19 @@ npm run test:e2e   # 端到端冒烟（真实 MCP 握手 + 真实窗口，会短
 - v2.2.0 起脚本输出走 Base64 信封，与系统代码页无关；如仍出现请升级到最新版
 
 ## 📋 更新日志
+
+### v3.0.0
+- 最低 Node.js 要求从已发布 v2.2.0 的 18.2 提高到 22.12；旧运行时需先升级，因此使用新的 major 版本。旧 MCP 握手、工具参数和返回字段保持兼容。
+- 明确秒单位、已移除参数和各客户端独立超时；启动日志显示版本，异常配置提示不包含原始值。
+- 浏览器保留提前结束时尚未提交的草稿；非法提交错误日志不包含回复片段。
+- 离线 Prism 与锁定的 1.30.0 核心一致，包含 DOM Clobbering 修复；打包检查阻止离线核心与已审计依赖不一致。
+- 发布前强制等待六组平台验证，精确发布当前版本的已验收 tarball。
+- 修复固定端口连续调用失败、旧连接复用及 HEAD 请求挂起。
+- 贯通 MCP 取消信号，区分真实提交确认与会话结束，覆盖浏览器启动挂起超时。
+- 修复 native 错误误报取消、代码注释和比较表达式丢失、Windows 回复静默截断。
+- 修复复制反馈异常，补充结果播报和浅色按钮 hover 对比度。
+- 提交 lockfile，更新现有 major 范围内依赖，增加构建、包内容检查、安装冒烟及 CI。
+- 保留消息上限，隔离并缓存 Markdown 渲染；远程图片逐张确认加载；迁移 SDK v2 并兼容旧客户端。
 
 ### v2.2.0
 - 🔒 **安全加固（browser 后端）**：`/submit` `/cancel` `/timeout` 增加随机会话令牌校验（防本机恶意网页 no-cors 跨站伪造）；Host 头白名单防 DNS rebinding；显式绑定 `127.0.0.1`；修复消息含 `</script>` 时内嵌 JSON 可逃逸脚本块的注入点（`\u003c` 转义）；CSP 增加 `frame-ancestors 'none'` 与 `X-Frame-Options: DENY`

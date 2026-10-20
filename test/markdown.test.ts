@@ -8,6 +8,40 @@ import { renderMarkdownSafe, markdownToPlain } from '../src/core/markdown.js';
 
 // ---------- renderMarkdownSafe（XSS 净化） ----------
 
+test('远程图片：净化后没有自动请求地址，保留域名、替代文字和点击加载地址', () => {
+  const html = renderMarkdownSafe('![说明](https://example.com/private.png) <img src="//images.example/a.png" onerror="alert(1)">');
+  assert.ok(!/<img[^>]+src=["'](?:https?:)?\/\//i.test(html));
+  assert.match(html, /data-remote-src="https:\/\/example.com\/private.png"/);
+  assert.match(html, /data-remote-alt="说明"/);
+  assert.ok(!html.includes('onerror'));
+  const local = renderMarkdownSafe('![local](/prism/local.png) ![data](data:image/png;base64,AA==)');
+  assert.match(local, /src="\/prism\/local.png"/);
+  assert.match(local, /src="data:image\/png;base64,AA=="/);
+});
+
+test('远程图片：混合大小写、控制字符和反斜杠地址不能触发自动外部请求', () => {
+  for (const src of ['HTTPS://example.com/a.png', 'https:&#10;//example.com/a.png', '\\\\example.com/a.png', 'javascript:alert(1)', 'file:///secret']) {
+    const html = renderMarkdownSafe('<img src="' + src + '" alt="说明" onload="alert(1)">');
+    assert.ok(!/<img[^>]+src=["'](?!data:)/i.test(html), html);
+    assert.ok(!html.includes('onload'), html);
+  }
+});
+
+test('复审R3：占位域名和协议相对地址仍需点击确认，本地及 data 图片保持兼容', () => {
+  for (const src of ['//feedback.invalid/a.png', '//FEEDBACK.invalid:80/a.png',
+    '\\\\feedback.invalid/a.png', '/\\feedback.invalid/a.png', '&#1;//feedback.invalid/a.png',
+    '&#47;&#47;feedback.invalid/a.png', 'http://feedback.invalid/a.png']) {
+    const html = renderMarkdownSafe('<img src="' + src + '" alt="说明">');
+    assert.ok(!/<img[^>]+src=/i.test(html), html);
+    assert.match(html, /class="remote-image"/, html);
+  }
+  for (const src of ['/prism/local.png', './local.png', 'images/local.png', 'data:image/png;base64,AA==']) {
+    const html = renderMarkdownSafe('<img src="' + src + '">');
+    assert.match(html, /<img[^>]+src=/i, html);
+    assert.ok(!html.includes('remote-image'), html);
+  }
+});
+
 test('净化：<script> 标签被剥离', () => {
   const html = renderMarkdownSafe('<script>alert(1)</script>hello');
   assert.ok(!html.includes('<script'), `script tag leaked: ${html}`);
@@ -121,4 +155,17 @@ test('轻量化：空输入与纯空白', () => {
 
 test('轻量化：行中减号不被当列表（"a - b"）', () => {
   assert.equal(markdownToPlain('a - b'), 'a - b');
+});
+
+test('轻量化：代码块和行内代码中的 HTML 注释完整保留', () => {
+  assert.equal(markdownToPlain('```html\n<!-- important warning -->\n```'), '<!-- important warning -->');
+  assert.equal(markdownToPlain('`<!-- inline warning -->`'), '<!-- inline warning -->');
+  assert.equal(markdownToPlain('before <!-- hidden --> after'), 'before  after');
+});
+
+test('轻量化：无空格的尖括号比较表达式完整保留', () => {
+  assert.equal(markdownToPlain('if x<y and z>0 then stop'), 'if x<y and z>0 then stop');
+  assert.equal(markdownToPlain('vector<T> value'), 'vector<T> value');
+  assert.equal(markdownToPlain('if x<a and b>0 then stop'), 'if x<a and b>0 then stop');
+  assert.equal(markdownToPlain('vector<B> value'), 'vector<B> value');
 });

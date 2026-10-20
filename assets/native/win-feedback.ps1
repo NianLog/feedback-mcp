@@ -123,7 +123,7 @@ if ($form.Tag.status -ne 'timeout' -and $dialogResult -eq [System.Windows.Forms.
 $response = $txtResponse.Text
 # keep in sync with server-side MAX_RESPONSE_CHARS
 if ($response.Length -gt 1000000) {
-    $response = $response.Substring(0, 1000000)
+    $response = $response.Substring(0, 1000000) + "`n[feedback-mcp] Response truncated at 1,000,000 characters."
 }
 $form.Tag | Add-Member -MemberType NoteProperty -Name response -Value $response -Force
 

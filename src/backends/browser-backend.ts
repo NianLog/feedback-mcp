@@ -23,6 +23,7 @@ import { fileURLToPath } from 'node:url';
 import { generateHTML, generateFinalHTML, CSP_HEADER } from '../core/html-template.js';
 import type { DialogOptions, DialogResult, UIBackend } from '../core/types.js';
 import { launchBrowserForUrl } from './browser-launch.js';
+import { renderMarkdownInWorker, type RenderedMarkdown } from '../core/markdown-render.js';
 
 /** 当前模块所在目录（定位包内 assets/prism） */
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -137,7 +138,7 @@ function servePrismAsset(reqUrl: string, res: http.ServerResponse): void {
 /** BrowserBackend 构造选项（测试注入点） */
 export interface BrowserBackendOptions {
   /** 自定义浏览器启动器（默认 launchBrowserForUrl） */
-  launcher?: (url: string) => Promise<string>;
+  launcher?: (url: string, signal?: AbortSignal) => Promise<string>;
   /** 服务器就绪回调（集成测试用来获取 URL） */
   onServerReady?: (url: string) => void;
   /** 对话框结束后的延迟关停毫秒数（默认 2000；测试可注入更小值加速收尾） */
@@ -150,7 +151,8 @@ export interface BrowserBackendOptions {
  * 富文本（Markdown + 代码高亮）、跨平台一致、内存较高。
  */
 export class BrowserBackend implements UIBackend {
-  private readonly launcher: (url: string) => Promise<string>;
+  private readonly portClosures = new Map<number, Promise<void>>();
+  private readonly launcher: (url: string, signal?: AbortSignal) => Promise<string>;
   private readonly onServerReady?: (url: string) => void;
   private readonly postResolveTeardownMs: number;
 
@@ -167,6 +169,26 @@ export class BrowserBackend implements UIBackend {
 
   /** 展示浏览器对话框并等待用户响应 */
   show(options: DialogOptions): Promise<DialogResult> {
+    if (options.signal?.aborted) return Promise.resolve({ submitted: false });
+    if (!options.port) return this.showOne(options);
+    const port = options.port;
+    const previous = this.portClosures.get(port);
+    let release!: () => void;
+    const closed = new Promise<void>((resolve) => { release = resolve; });
+    this.portClosures.set(port, closed);
+    const releasePort = () => {
+      release();
+      if (this.portClosures.get(port) === closed) this.portClosures.delete(port);
+    };
+    const run = () => this.showOne(options, releasePort);
+    return previous ? previous.then(run) : run();
+  }
+
+  private showOne(options: DialogOptions, releasePort: () => void = () => {}): Promise<DialogResult> {
+    if (options.signal?.aborted) {
+      releasePort();
+      return Promise.resolve({ submitted: false });
+    }
     // 钳制到 Node 定时器上限，防止溢出导致定时器立即触发
     const timeout = Math.min(options.timeout || 300000, MAX_TIMER_MS);
     // 会话令牌：页面脚本持有，POST 端点必须匹配（跨站网页无法读取）
@@ -176,9 +198,13 @@ export class BrowserBackend implements UIBackend {
       let server: http.Server | null = null;
       let timeoutId: NodeJS.Timeout | null = null;
       let teardownTimer: NodeJS.Timeout | null = null;
-      let resolved = false;
+      let finalStatus: 'submitted' | 'cancelled' | 'timeout' | 'error' | undefined;
+      let deadline = 0;
       let pageSeen = false;
       const sockets = new Set<Socket>();
+      const eventStreams = new Set<http.ServerResponse>();
+      const renderLifetime = new AbortController();
+      let rendering: Promise<RenderedMarkdown> | undefined;
       let allowedHosts: string[] = [];
 
       // 终局关停：停止接收新连接，短暂冲刷在途响应后强制销毁残余 socket
@@ -189,19 +215,20 @@ export class BrowserBackend implements UIBackend {
           timeoutId = null;
         }
         if (!server) return;
+        const closingServer = server;
+        server = null;
         try {
-          server.close();
+          closingServer.close(() => releasePort());
         } catch {
-          /* 已关闭 */
+          releasePort();
         }
         // server.close() 不中断 keep-alive 连接；先关空闲，短暂冲刷后强制销毁残余
-        server.closeIdleConnections?.();
+        closingServer.closeIdleConnections?.();
         const hardKill = setTimeout(() => {
           for (const s of sockets) s.destroy();
-          server?.closeAllConnections?.();
+          closingServer.closeAllConnections?.();
         }, SOCKET_DRAIN_MS);
         hardKill.unref?.();
-        server = null;
       };
 
       // 结束后的关停调度：页面已加载过的窗口持有自己的收尾逻辑（JS 自关），
@@ -215,17 +242,28 @@ export class BrowserBackend implements UIBackend {
       };
 
       const resolveOnce = (result: DialogResult, teardownMs?: number) => {
-        if (resolved) return;
-        resolved = true;
+        if (finalStatus) return;
+        finalStatus = result.error ? 'error' : result.submitted ? 'submitted' : result.timedOut ? 'timeout' : 'cancelled';
+        renderLifetime.abort();
+        options.signal?.removeEventListener('abort', onAbort);
         if (timeoutId) {
           clearTimeout(timeoutId);
           timeoutId = null;
         }
         scheduleTeardown(teardownMs ?? (pageSeen ? this.postResolveTeardownMs : POST_RESOLVE_MAX_WAIT_MS));
-        resolve(result);
+        for (const stream of eventStreams) {
+          stream.end(`data: ${JSON.stringify({ finished: true, status: finalStatus })}\n\n`);
+        }
+        eventStreams.clear();
+        // 结果完成后队列会前进，先等渲染线程退出。
+        if (rendering) void rendering.then(() => resolve(result));
+        else resolve(result);
       };
+      const onAbort = () => resolveOnce({ submitted: false });
 
       server = http.createServer((req, res) => {
+        // 固定端口会用于下一会话，旧连接不能留在客户端连接池中复用。
+        res.setHeader('Connection', 'close');
         // 客户端断开等流错误不应演化为未处理异常
         res.on('error', (err) => {
           console.error('[feedback-mcp] Response error:', err.message);
@@ -256,6 +294,22 @@ export class BrowserBackend implements UIBackend {
           const url = new URL(req.url || '/', 'http://127.0.0.1');
           const pathname = url.pathname;
 
+          if (req.method === 'GET' && pathname === '/events') {
+            if (!tokenMatches(req, token)) {
+              safeJson(403, { error: 'Invalid token' });
+              return;
+            }
+            res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-store' });
+            if (finalStatus) {
+              res.end(`data: ${JSON.stringify({ finished: true, status: finalStatus })}\n\n`);
+            } else {
+              res.write(': connected\n\n');
+              eventStreams.add(res);
+              res.once('close', () => eventStreams.delete(res));
+            }
+            return;
+          }
+
           // 提交（令牌校验 + Buffer 收集体）
           if (req.method === 'POST' && pathname === '/submit') {
             if (!tokenMatches(req, token)) {
@@ -263,9 +317,9 @@ export class BrowserBackend implements UIBackend {
               return;
             }
 
-            if (resolved) {
+            if (finalStatus) {
               // 会话已结束后到达的请求（晚到窗口/重复提交）：如实告知已结束，页面据此收尾
-              safeJson(200, { finished: true });
+              safeJson(200, { finished: true, status: finalStatus });
               return;
             }
 
@@ -292,6 +346,10 @@ export class BrowserBackend implements UIBackend {
 
             req.on('end', () => {
               if (aborted) return;
+              if (finalStatus) {
+                safeJson(200, { finished: true, status: finalStatus });
+                return;
+              }
               try {
                 const body = Buffer.concat(chunks).toString('utf8');
                 const parsed = JSON.parse(body) as { response?: unknown };
@@ -301,10 +359,10 @@ export class BrowserBackend implements UIBackend {
                   return;
                 }
 
-                safeJson(200, { success: true });
                 resolveOnce({ submitted: true, response: parsed.response });
-              } catch (error) {
-                console.error('[feedback-mcp] Submit JSON parse error:', error);
+                safeJson(200, { success: true, status: finalStatus });
+              } catch {
+                console.error('[feedback-mcp] Invalid submit JSON');
                 safeJson(400, { error: 'Invalid JSON format' });
               }
             });
@@ -317,12 +375,12 @@ export class BrowserBackend implements UIBackend {
               safeJson(403, { error: 'Invalid token' });
               return;
             }
-            if (resolved) {
-              safeJson(200, { finished: true });
+            if (finalStatus) {
+              safeJson(200, { finished: true, status: finalStatus });
               return;
             }
-            safeJson(200, { success: true });
             resolveOnce({ submitted: false });
+            safeJson(200, { success: true, status: finalStatus });
             return;
           }
 
@@ -332,12 +390,12 @@ export class BrowserBackend implements UIBackend {
               safeJson(403, { error: 'Invalid token' });
               return;
             }
-            if (resolved) {
-              safeJson(200, { finished: true });
+            if (finalStatus) {
+              safeJson(200, { finished: true, status: finalStatus });
               return;
             }
-            safeJson(200, { success: true });
             resolveOnce({ submitted: false, timedOut: true });
+            safeJson(200, { success: true, status: finalStatus });
             return;
           }
 
@@ -367,23 +425,29 @@ export class BrowserBackend implements UIBackend {
               'Referrer-Policy': 'no-referrer',
               'Cache-Control': 'no-store',
             });
-            if (req.method === 'HEAD') return;
+            if (req.method === 'HEAD') { res.end(); return; }
 
             pageSeen = true;
-            if (resolved) {
+            if (finalStatus) {
               scheduleTeardown(this.postResolveTeardownMs);
               res.end(generateFinalHTML(options.language));
               return;
             }
-            res.end(
-              generateHTML(
+            void (rendering ??= renderMarkdownInWorker(options.message, renderLifetime.signal)).then((rendered) => {
+              if (res.writableEnded || res.destroyed) return;
+              if (finalStatus) { res.end(generateFinalHTML(options.language)); return; }
+              res.end(generateHTML(
                 options.message,
-                timeout,
+                Math.max(0, deadline - Date.now()),
                 options.language,
                 options.theme ?? 'auto',
-                token
-              )
-            );
+                token,
+                rendered
+              ));
+            }).catch(() => {
+              resolveOnce({ submitted: false, error: 'Failed to prepare dialog page' });
+              if (!res.writableEnded && !res.destroyed) res.end(generateFinalHTML(options.language));
+            });
             return;
           }
 
@@ -410,6 +474,8 @@ export class BrowserBackend implements UIBackend {
         resolveOnce({ submitted: false, error: `HTTP server error: ${error.message}` });
       });
 
+      options.signal?.addEventListener('abort', onAbort, { once: true });
+
       // 监听回环地址（显式 127.0.0.1，避免 localhost 解析差异与外部暴露）
       server.listen(options.port ?? 0, '127.0.0.1', async () => {
         const address = server?.address();
@@ -422,12 +488,19 @@ export class BrowserBackend implements UIBackend {
         allowedHosts = [`127.0.0.1:${port}`, `localhost:${port}`, `[::1]:${port}`];
         const url = `http://127.0.0.1:${port}`;
 
+        deadline = Date.now() + timeout;
+        timeoutId = setTimeout(() => {
+          console.error('[feedback-mcp] Dialog timed out');
+          resolveOnce({ submitted: false, timedOut: true });
+        }, timeout);
+
         console.error(`[feedback-mcp] Dialog opened at ${url}`);
         this.onServerReady?.(url);
+        if (finalStatus) return;
 
         // 打开浏览器窗口；启动失败必须显式报错，不能伪装成"用户取消"
         try {
-          const how = await this.launcher(url);
+          const how = await this.launcher(url, options.signal);
           console.error(`[feedback-mcp] Dialog window opened via ${how}`);
         } catch (error) {
           console.error('[feedback-mcp] Failed to open browser:', error);
@@ -439,13 +512,8 @@ export class BrowserBackend implements UIBackend {
           return;
         }
 
-        // 服务器侧超时兜底（客户端上报与本地定时器先到者生效，resolveOnce 幂等）
-        timeoutId = setTimeout(() => {
-          console.error('[feedback-mcp] Dialog timed out');
-          resolveOnce({ submitted: false, timedOut: true });
-        }, timeout);
       });
-    });
+    }).catch((error) => { releasePort(); throw error; });
   }
 }
 

@@ -11,11 +11,12 @@
 
 import { renderMarkdownSafe } from './markdown.js';
 import type { Language, ThemeMode } from './types.js';
+import type { RenderedMarkdown } from './markdown-render.js';
 
 /**
  * Content-Security-Policy 响应头。
  *
- * 纵深防御：即便 sanitize 净化层被绕过，connect-src 'self' 也能阻止脚本把数据外泄到外部，
+ * connect-src 'self' 限制脚本网络请求；图片来源由 img-src 单独控制。
  * object-src/frame-src 'none'、frame-ancestors 'none' 阻止插件与嵌入帧。
  * 说明：script-src/style-src 暂需 'unsafe-inline'，因为当前页面是内联脚本/样式。
  */
@@ -55,6 +56,8 @@ interface UIText {
   copyPlain: string;
   copyMarkdown: string;
   copySuccess: string;
+  copyFailed: string;
+  responseNotSubmitted: string;
   inputLabel: string;
   inputPlaceholder: string;
   submit: string;
@@ -72,6 +75,12 @@ interface UIText {
   cancelling: string;
   manualCloseHint: string;
   finishedTitle: string;
+  renderFallback: string;
+  highlightSkipped: string;
+  remoteImageLoad: string;
+  remoteImageLoading: string;
+  remoteImageDisclosure: string;
+  remoteImageFailed: string;
 }
 
 /** 按语言取界面文案（未知语言回退中文） */
@@ -84,6 +93,8 @@ function getUIText(language: Language): UIText {
         copyPlain: 'Copy as Plain Text',
         copyMarkdown: 'Copy as Markdown',
         copySuccess: 'Copied',
+        copyFailed: 'Copy failed. Select the text and copy it manually.',
+        responseNotSubmitted: 'The session ended without confirmation of this reply. Your text is kept here; check the existing outcome before closing.',
         inputLabel: 'Your response:',
         inputPlaceholder: 'Please enter your response here...',
         submit: 'Submit',
@@ -95,12 +106,18 @@ function getUIText(language: Language): UIText {
         submitSuccess: 'Submitted — window will close...',
         cancelMessage: 'Cancelled — window will close...',
         shortcutsHint: 'Shortcuts: Ctrl+Enter to submit · Esc to cancel',
-        errorMessage: 'Error occurred, please retry',
+        errorMessage: 'The result could not be confirmed. Keep your text and check the outcome before retrying.',
         retryButton: 'Retry',
         submitting: 'Submitting...',
         cancelling: 'Processing...',
         manualCloseHint: '(close this window manually if it does not close itself)',
         finishedTitle: 'Session ended',
+        renderFallback: 'Rich text could not finish within the rendering limits. The complete original text is shown; copying and replying still work.',
+        highlightSkipped: 'This code block is shown without highlighting to keep the page responsive. Its complete text is preserved.',
+        remoteImageLoad: 'Load image',
+        remoteImageLoading: 'Loading image...',
+        remoteImageDisclosure: 'Loading sends a request to this website, revealing your network address and visit time.',
+        remoteImageFailed: 'The image could not load. Check the network or address before retrying.',
       }
     : {
         title: '交互式反馈',
@@ -109,6 +126,8 @@ function getUIText(language: Language): UIText {
         copyPlain: '复制为纯文本',
         copyMarkdown: '复制为 Markdown',
         copySuccess: '已复制',
+        copyFailed: '复制失败，请手动选择内容后复制',
+        responseNotSubmitted: '会话已结束，本次回复未获确认。内容已保留，请核对已有结果后关闭窗口。',
         inputLabel: '您的回复：',
         inputPlaceholder: '请在此输入您的回复...',
         submit: '提交',
@@ -120,12 +139,18 @@ function getUIText(language: Language): UIText {
         submitSuccess: '已提交——窗口将自动关闭',
         cancelMessage: '已取消——窗口将自动关闭',
         shortcutsHint: '快捷键：Ctrl+Enter 提交 · Esc 取消',
-        errorMessage: '发生错误，请重试',
+        errorMessage: '暂时无法确认结果，请保留回复内容，核对后再决定是否重试',
         retryButton: '重试',
         submitting: '提交中...',
         cancelling: '处理中...',
         manualCloseHint: '（若窗口未自动关闭，请手动关闭）',
         finishedTitle: '会话已结束',
+        renderFallback: '富文本未能在渲染限制内完成，已显示完整原文，仍可复制和回复。',
+        highlightSkipped: '为保持页面响应，这段代码显示原文并跳过高亮，内容已完整保留。',
+        remoteImageLoad: '加载这张图片',
+        remoteImageLoading: '图片加载中...',
+        remoteImageDisclosure: '加载会向该网站发送请求，并暴露你的网络地址和访问时间。',
+        remoteImageFailed: '图片加载失败，请核对网络或地址后重试。',
       };
 }
 
@@ -144,9 +169,10 @@ export function generateHTML(
   timeout: number,
   language: string,
   theme: string,
-  token: string
+  token: string,
+  rendered?: RenderedMarkdown
 ): string {
-  const processedMessage = renderMarkdownSafe(message);
+  const processedMessage = rendered?.html ?? renderMarkdownSafe(message);
 
   // 防御性白名单：本模板是导出 API，不能信任调用方已校验
   const lang: Language = language === 'en' ? 'en' : 'zh';
@@ -174,7 +200,7 @@ export function generateHTML(
       --border: #e5e7eb;
       --border-strong: #d1d5db;
       --accent: #15803d;
-      --accent-hover: #16a34a;
+      --accent-hover: #166534;
       --accent-soft: rgba(21, 128, 61, 0.12);
       --danger: #dc2626;
       --code-bg: #1f232a;
@@ -346,6 +372,28 @@ export function generateHTML(
       color: #ffffff;
     }
 
+    .sr-only {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      overflow: hidden;
+      clip-path: inset(50%);
+      white-space: nowrap;
+    }
+
+    .render-note, .highlight-note {
+      margin: 12px 0;
+      color: var(--text-muted);
+      font-size: 13px;
+      line-height: 1.6;
+    }
+
+    .render-note { padding: 0 24px; }
+    .content .plain-fallback { white-space: pre-wrap; overflow-wrap: anywhere; }
+    .remote-image { display: inline-flex; flex-direction: column; gap: 8px; max-width: 100%; margin: 8px 0; }
+    .remote-image button { white-space: normal; overflow-wrap: anywhere; }
+    .remote-image-hint { color: var(--text-muted); font-size: 13px; line-height: 1.6; }
+
     .input-section {
       padding: 18px 24px 22px;
       border-top: 1px solid var(--border);
@@ -492,6 +540,7 @@ export function generateHTML(
       <div class="shortcuts-hint">${uiText.shortcutsHint}</div>
     </div>
 
+    ${rendered?.fallback ? '<p class="render-note" role="status">' + uiText.renderFallback + '</p>' : ''}
     <div class="content" id="content">
       ${processedMessage}
     </div>
@@ -509,6 +558,7 @@ export function generateHTML(
         <button class="btn btn-primary" onclick="submitResponse()">${uiText.submit}</button>
         <button class="btn btn-secondary" onclick="cancel()">${uiText.cancel}</button>
       </div>
+      <div id="feedback-status" class="sr-only" role="status" aria-live="polite"></div>
     </div>
   </div>
 
@@ -523,17 +573,23 @@ export function generateHTML(
     // 防重入状态：避免按钮与快捷键重复触发 submit/cancel
     let submitting = false;
     let cancelling = false;
+    let finished = false;
+    let attemptedReply = false;
 
     // 携带令牌的 POST
     function post(path, options) {
       const opts = options || {};
       opts.method = 'POST';
       opts.headers = Object.assign({ 'X-Feedback-Token': FEEDBACK_TOKEN }, opts.headers || {});
-      return fetch(path, opts);
+      return fetch(path, opts).then(function (res) {
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        return res.json();
+      });
     }
 
     // 更新倒计时（每次由 deadline 重算，后台标签页节流也不会失真）
     function updateTimer() {
+      if (finished) return;
       const timerEl = document.getElementById('timer');
       const remainingMs = deadline - Date.now();
 
@@ -561,9 +617,9 @@ export function generateHTML(
 
     // 超时上报（区别于取消：服务端记录为 timedOut，便于 AI 区分"超时"与"主动取消"）
     function timeoutSubmit() {
-      showFinalScreen('${uiText.timeoutMessage}');
-      post('/timeout').catch(function () {}).finally(function () {
-        setTimeout(tryCloseWindow, 800);
+      if (finished) return;
+      post('/timeout').then(function (state) { finishSession(state.finished ? 'ended' : state.status); }).catch(function () {
+        if (!finished) showError('${uiText.errorMessage}');
       });
     }
 
@@ -622,19 +678,100 @@ export function generateHTML(
 
     restoreTheme();
 
-    // 复制为纯文本
-    function copyAsPlainText(e) {
-      const content = document.getElementById('content').innerText;
-      navigator.clipboard.writeText(content).then(function () {
-        showCopied(e.currentTarget);
+    document.querySelectorAll('#content .remote-image').forEach(function (placeholder) {
+      let url;
+      try { url = new URL(placeholder.getAttribute('data-remote-src'), window.location.href); }
+      catch (error) { return; }
+      if (url.protocol !== 'http:' && url.protocol !== 'https:') return;
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'copy-btn';
+      const alt = placeholder.getAttribute('data-remote-alt') || '';
+      const label = '${uiText.remoteImageLoad}' + ' (' + url.host + ')' + (alt ? ': ' + alt : '');
+      button.textContent = label;
+      button.setAttribute('aria-label', label);
+      const hint = document.createElement('span');
+      hint.className = 'remote-image-hint';
+      hint.textContent = '${uiText.remoteImageDisclosure}';
+      placeholder.replaceChildren(button, hint);
+      button.addEventListener('click', function () {
+        if (finished || button.disabled) return;
+        button.disabled = true;
+        button.textContent = '${uiText.remoteImageLoading}';
+        const image = document.createElement('img');
+        image.alt = alt;
+        image.referrerPolicy = 'no-referrer';
+        ['title', 'width', 'height'].forEach(function (name) {
+          const value = placeholder.getAttribute('data-remote-' + name);
+          if (value) image.setAttribute(name, value);
+        });
+        image.onload = function () { placeholder.replaceChildren(image); };
+        image.onerror = function () {
+          button.disabled = false;
+          button.textContent = label;
+          hint.textContent = '${uiText.remoteImageFailed}';
+          hint.setAttribute('role', 'alert');
+        };
+        image.src = url.href;
       });
+    });
+
+    // 服务端取消或超时主动通知页面，不依赖按钮请求或后台倒计时。
+    const sessionEvents = typeof EventSource === 'function'
+      ? new EventSource('/events?token=' + encodeURIComponent(FEEDBACK_TOKEN)) : null;
+    if (sessionEvents) {
+      sessionEvents.onmessage = function (event) {
+        try {
+          const state = JSON.parse(event.data);
+          // 提交成功只由本次 POST 的确认决定，其他窗口或过期请求不能代为确认。
+          if (state.status === 'submitted') {
+            sessionEvents.close();
+            if (!submitting) finishSession('ended');
+          } else finishSession(state.status);
+        } catch (error) { /* 等待下一条合法事件 */ }
+      };
+      window.addEventListener('pagehide', function () { sessionEvents.close(); });
+    }
+
+    function finishSession(status) {
+      if (finished) return;
+      finished = true;
+      if (sessionEvents) sessionEvents.close();
+      const input = document.getElementById('response');
+      if (status !== 'submitted' && input && input.value && (attemptedReply || !cancelling)) {
+        document.querySelectorAll('.btn').forEach(function (button) { button.disabled = true; });
+        document.querySelector('.btn-primary').textContent = '${uiText.submit}';
+        document.querySelector('.btn-secondary').textContent = '${uiText.cancel}';
+        document.getElementById('timer').textContent = '${uiText.finishedTitle}';
+        const statusEl = document.getElementById('feedback-status');
+        statusEl.classList.remove('sr-only');
+        statusEl.textContent = '${uiText.responseNotSubmitted}';
+        return;
+      }
+      const message = status === 'submitted' ? '${uiText.submitSuccess}'
+        : status === 'cancelled' ? '${uiText.cancelMessage}'
+        : status === 'timeout' ? '${uiText.timeoutMessage}' : '${uiText.finishedTitle}';
+      showFinalScreen(message);
+      setTimeout(tryCloseWindow, 1500);
+    }
+
+    // 复制为纯文本
+    async function copyAsPlainText(e) {
+      const button = e.currentTarget;
+      const content = document.getElementById('content').innerText;
+      try {
+        await navigator.clipboard.writeText(content);
+        showCopied(button);
+      } catch (error) { showError('${uiText.copyFailed}'); }
     }
 
     // 复制为Markdown
-    function copyAsMarkdown(e) {
-      navigator.clipboard.writeText(originalMarkdown).then(function () {
-        showCopied(e.currentTarget);
-      });
+    async function copyAsMarkdown(e) {
+      const button = e.currentTarget;
+      try {
+        await navigator.clipboard.writeText(originalMarkdown);
+        showCopied(button);
+      } catch (error) { showError('${uiText.copyFailed}'); }
     }
 
     // 显示复制成功状态
@@ -642,6 +779,8 @@ export function generateHTML(
       const originalText = button.textContent;
       button.textContent = '${uiText.copySuccess}';
       button.classList.add('copied');
+      const status = document.getElementById('feedback-status');
+      if (status) status.textContent = '${uiText.copySuccess}';
       setTimeout(function () {
         button.textContent = originalText;
         button.classList.remove('copied');
@@ -650,8 +789,9 @@ export function generateHTML(
 
     // 提交响应（带错误处理 + 防重入）
     function submitResponse() {
-      if (submitting) return;
+      if (submitting || cancelling || finished) return;
       submitting = true;
+      attemptedReply = true;
 
       const response = document.getElementById('response').value;
       const submitBtn = document.querySelector('.btn-primary');
@@ -659,49 +799,46 @@ export function generateHTML(
 
       submitBtn.textContent = '${uiText.submitting}';
       submitBtn.disabled = true;
+      document.querySelector('.btn-secondary').disabled = true;
 
       post('/submit', {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ response: response })
-      }).then(function (res) {
-        if (res.ok) {
-          showFinalScreen('${uiText.submitSuccess}');
-          setTimeout(tryCloseWindow, 1500);
-        } else {
-          throw new Error('HTTP ' + res.status);
-        }
+      }).then(function (state) {
+        finishSession(state.success ? state.status : 'ended');
       }).catch(function (error) {
+        if (finished) return;
         console.error('[feedback-mcp] Submit error:', error);
         submitting = false;
         submitBtn.textContent = originalText;
         submitBtn.disabled = false;
+        document.querySelector('.btn-secondary').disabled = false;
         showError('${uiText.errorMessage} (' + error.message + ')');
       });
     }
 
     // 取消（带错误处理 + 防重入）
     function cancel() {
-      if (cancelling) return;
+      if (submitting || cancelling || finished) return;
       cancelling = true;
+      attemptedReply = false;
 
       const cancelBtn = document.querySelector('.btn-secondary');
       const originalText = cancelBtn.textContent;
 
       cancelBtn.textContent = '${uiText.cancelling}';
       cancelBtn.disabled = true;
+      document.querySelector('.btn-primary').disabled = true;
 
-      post('/cancel').then(function (res) {
-        if (res.ok) {
-          showFinalScreen('${uiText.cancelMessage}');
-          setTimeout(tryCloseWindow, 1500);
-        } else {
-          throw new Error('HTTP ' + res.status);
-        }
+      post('/cancel').then(function (state) {
+        finishSession(state.finished ? 'ended' : state.status);
       }).catch(function (error) {
+        if (finished) return;
         console.error('[feedback-mcp] Cancel error:', error);
         cancelling = false;
         cancelBtn.textContent = originalText;
         cancelBtn.disabled = false;
+        document.querySelector('.btn-primary').disabled = false;
         showError('${uiText.errorMessage} (' + error.message + ')');
       });
     }
@@ -711,13 +848,15 @@ export function generateHTML(
       document.body.innerHTML =
         '<div style="display:flex;flex-direction:column;align-items:center;justify-content:center;' +
         'gap:12px;min-height:100vh;font-size:22px;color:#1f232a;background:#f4f5f7;">' +
-        '<div>' + message + '</div>' +
+        '<div role="status" tabindex="-1">' + message + '</div>' +
         '<div style="font-size:13px;color:#6b7280;">${uiText.manualCloseHint}</div></div>';
+      document.querySelector('[role="status"]').focus();
     }
 
     // 显示错误信息
     function showError(message) {
       const errorDiv = document.createElement('div');
+      errorDiv.setAttribute('role', 'alert');
       errorDiv.style.cssText = \`
         position: fixed;
         top: 20px;
@@ -760,7 +899,7 @@ export function generateHTML(
   </script>
 
   <!-- Prism.js 代码高亮脚本（本地化，按依赖顺序预加载常用语言，离线可用） -->
-  <script src="/prism/prism.js"></script>
+  <script src="/prism/prism.js" data-manual></script>
   <script src="/prism/components/prism-clike.js"></script>
   <script src="/prism/components/prism-markup.js"></script>
   <script src="/prism/components/prism-css.js"></script>
@@ -777,7 +916,32 @@ export function generateHTML(
   <script src="/prism/components/prism-java.js"></script>
   <script src="/prism/components/prism-sql.js"></script>
   <script src="/prism/components/prism-yaml.js"></script>
-  <script>if (window.Prism) { Prism.highlightAll(); }</script>
+  <script>
+    if (window.Prism) {
+      const blocks = Array.from(document.querySelectorAll('#content pre code'));
+      const MAX_HIGHLIGHT_BLOCK_CHARS = 20000;
+      let remainingHighlightChars = 50000;
+      let blockIndex = 0;
+      function highlightNext() {
+        if (finished || blockIndex >= blocks.length) return;
+        const code = blocks[blockIndex++];
+        const size = code.textContent.length;
+        let skipped = size > MAX_HIGHLIGHT_BLOCK_CHARS || size > remainingHighlightChars;
+        if (!skipped) {
+          remainingHighlightChars -= size;
+          try { Prism.highlightElement(code); } catch (error) { skipped = true; }
+        }
+        if (skipped) {
+          const note = document.createElement('p');
+          note.className = 'highlight-note';
+          note.textContent = '${uiText.highlightSkipped}';
+          code.parentElement.insertAdjacentElement('beforebegin', note);
+        }
+        setTimeout(highlightNext, 0);
+      }
+      highlightNext();
+    }
+  </script>
 </body>
 </html>`;
 }

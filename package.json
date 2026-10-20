@@ -1,6 +1,6 @@
 {
   "name": "feedback-mcp-server",
-  "version": "2.2.0",
+  "version": "3.0.0",
   "description": "A lightweight MCP server for interactive user feedback via browser dialogs",
   "main": "dist/index.js",
   "type": "module",
@@ -9,16 +9,25 @@
     "feedback-mcp-server": "dist/index.js"
   },
   "engines": {
-    "node": ">=18.2.0"
+    "node": ">=22.12.0"
   },
   "scripts": {
     "build": "tsc",
+    "check": "tsc --noEmit",
+    "prepack": "npm run build && node scripts/package-smoke.mjs --check",
     "start": "node dist/index.js",
     "dev": "tsx src/index.ts",
-    "test": "tsx --test test/config.test.ts test/markdown.test.ts test/html-template.test.ts test/browser-backend.test.ts test/native-backend.test.ts test/dialog-queue.test.ts",
+    "test": "tsx --test test/config.test.ts test/markdown.test.ts test/markdown-worker.test.ts test/html-template.test.ts test/html-runtime.test.ts test/browser-backend.test.ts test/native-backend.test.ts test/dialog-queue.test.ts test/mcp-protocol.test.ts",
+    "test:package": "npm run build && node scripts/package-smoke.mjs",
     "test:e2e": "tsx scripts/e2e-smoke.ts"
   },
-  "keywords": ["mcp", "model-context-protocol", "feedback", "interactive", "dialog"],
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "feedback",
+    "interactive",
+    "dialog"
+  ],
   "author": "NianLog <nianlog@outlook.com>",
   "license": "MIT",
   "repository": {
@@ -37,13 +46,15 @@
     "LICENSE"
   ],
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.29.0",
+    "@modelcontextprotocol/server": "^2.3.1",
     "marked": "^16.4.1",
     "open": "^10.2.0",
-    "sanitize-html": "^2.17.5",
-    "zod": "^3.25.76"
+    "sanitize-html": "^2.18.1",
+    "zod": "^4.6.7"
   },
   "devDependencies": {
+    "@modelcontextprotocol/client": "^2.3.1",
+    "@modelcontextprotocol/sdk": "^1.32.1",
     "@types/node": "^24.9.2",
     "@types/sanitize-html": "^2.16.1",
     "prismjs": "^1.29.0",

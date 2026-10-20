@@ -35,6 +35,27 @@ test('FEEDBACK_TIMEOUT 钳制到 [5, 86400]', () => {
   assert.equal(parseConfig({ FEEDBACK_TIMEOUT: '999999999' }).defaultTimeoutMs, MAX_TIMEOUT_SEC * 1000);
 });
 
+test('旧毫秒配置和已移除参数有迁移提示，日志不泄露原始值', (t) => {
+  const messages: string[] = [];
+  t.mock.method(console, 'error', (...args: unknown[]) => messages.push(args.map(String).join(' ')));
+  const config = parseConfig({ FEEDBACK_TIMEOUT: '600000', FEEDBACK_MAX_TOKENS: 'private-value' });
+  assert.equal(config.defaultTimeoutMs, MAX_TIMEOUT_SEC * 1000);
+  assert.match(messages.join('\n'), /FEEDBACK_TIMEOUT.*seconds/);
+  assert.match(messages.join('\n'), /FEEDBACK_MAX_TOKENS.*removed/);
+  assert.doesNotMatch(messages.join('\n'), /private-value/);
+});
+
+test('非法超时回退有提示，正常秒配置保持安静', (t) => {
+  const messages: string[] = [];
+  t.mock.method(console, 'error', (...args: unknown[]) => messages.push(args.map(String).join(' ')));
+  assert.equal(parseConfig({ FEEDBACK_TIMEOUT: 'private-invalid-value' }).defaultTimeoutMs, 300000);
+  assert.match(messages.join('\n'), /FEEDBACK_TIMEOUT/);
+  assert.doesNotMatch(messages.join('\n'), /private-invalid-value/);
+  messages.length = 0;
+  assert.equal(parseConfig({ FEEDBACK_TIMEOUT: '600' }).defaultTimeoutMs, 600000);
+  assert.deepEqual(messages, []);
+});
+
 test('FEEDBACK_LANGUAGE 仅接受 zh/en，非法回退 zh', () => {
   assert.equal(parseConfig({ FEEDBACK_LANGUAGE: 'en' }).language, 'en');
   assert.equal(parseConfig({ FEEDBACK_LANGUAGE: 'zh' }).language, 'zh');

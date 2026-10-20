@@ -28,6 +28,8 @@ export interface DialogOptions {
   theme?: ThemeMode;
   /** 浏览器后端监听端口（0 = 随机）。固定端口可让 localStorage 主题偏好跨会话生效 */
   port?: number;
+  /** 调用取消信号；排队时取消不会展示窗口 */
+  signal?: AbortSignal;
 }
 
 /** 对话框返回结果 */

@@ -228,6 +228,23 @@ test('非法 JSON 与非法响应格式返回 400', async () => {
   await result;
 });
 
+test('非法提交不把回复片段写入日志，后续有效提交仍可完成', async (t) => {
+  const logs: string[] = [];
+  t.mock.method(console, 'error', (...args: unknown[]) => logs.push(args.map(String).join(' ')));
+  const controller = new AbortController();
+  const { result, getUrl } = startDialog({ signal: controller.signal });
+  try {
+    const url = await waitReady(getUrl);
+    const token = extractToken((await rawRequest(url)).body);
+    const invalid = await fetch(url + '/submit', { method: 'POST', headers: { 'X-Feedback-Token': token }, body: 'secret-reply' });
+    assert.equal(invalid.status, 400);
+    assert.doesNotMatch(logs.join('\n'), /secret-reply/);
+    const valid = await fetch(url + '/submit', { method: 'POST', headers: { 'X-Feedback-Token': token }, body: JSON.stringify({ response: '有效回复 ✓' }) });
+    assert.equal(valid.status, 200);
+    assert.deepEqual(await result, { submitted: true, response: '有效回复 ✓' });
+  } finally { controller.abort(); await result; }
+});
+
 test('路径遍历防护：/prism/.. 越界访问被拒绝', async () => {
   const { result, getUrl } = startDialog();
   const url = await waitReady(getUrl);
@@ -389,5 +406,97 @@ test('结束后重复加载与过期提交：收尾页 + finished 响应', async
     body: JSON.stringify({ response: '迟到的回复' }),
   });
   assert.equal(stale.status, 200);
-  assert.deepEqual(await stale.json(), { finished: true });
+  assert.deepEqual(await stale.json(), { finished: true, status: 'cancelled' });
+});
+
+test('同一固定端口连续展示 50 轮，等待旧服务释放后再监听', async () => {
+  const reservation = http.createServer();
+  await new Promise<void>((resolve) => reservation.listen(0, '127.0.0.1', resolve));
+  const port = (reservation.address() as { port: number }).port;
+  await new Promise<void>((resolve) => reservation.close(() => resolve()));
+  let ready!: (url: string) => void;
+  const backend = new BrowserBackend({
+    launcher: async () => 'stub',
+    onServerReady: (url) => ready(url),
+    postResolveTeardownMs: 10,
+  });
+  for (let round = 0; round < 50; round++) {
+    const readyPromise = new Promise<string>((resolve) => { ready = resolve; });
+    const result = backend.show({ message: `round ${round}`, language: 'zh', timeout: 2000, port });
+    const url = await Promise.race([
+      readyPromise,
+      result.then((value) => { throw new Error(value.error ?? 'dialog ended before binding'); }),
+    ]);
+    const token = extractToken((await rawRequest(url)).body);
+    await fetch(`${url}/submit`, {
+      method: 'POST', headers: { 'X-Feedback-Token': token }, body: JSON.stringify({ response: `${round}` }),
+    });
+    assert.deepEqual(await result, { submitted: true, response: `${round}` });
+  }
+});
+
+test('提交体读取期间取消，迟到的提交返回真实终态而非成功', async () => {
+  const { result, getUrl } = startDialog();
+  const url = await waitReady(getUrl);
+  const token = extractToken((await rawRequest(url)).body);
+  let complete!: () => void;
+  const submission = new Promise<{ status: number; body: string }>((resolve, reject) => {
+    const req = http.request(`${url}/submit`, { method: 'POST', headers: { 'X-Feedback-Token': token } }, (res) => {
+      const chunks: Buffer[] = [];
+      res.on('data', (chunk) => chunks.push(chunk));
+      res.on('end', () => resolve({ status: res.statusCode!, body: Buffer.concat(chunks).toString() }));
+    });
+    req.on('error', reject);
+    req.write('{"response":');
+    complete = () => req.end('"late reply"}');
+  });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  await fetch(`${url}/cancel`, { method: 'POST', headers: { 'X-Feedback-Token': token } });
+  assert.deepEqual(await result, { submitted: false });
+  complete();
+  const actual = await submission;
+  assert.equal(actual.status, 200);
+  assert.deepEqual(JSON.parse(actual.body), { finished: true, status: 'cancelled' });
+});
+
+test('HEAD 页面返回完整空响应，不挂起连接', async () => {
+  const { result, getUrl } = startDialog();
+  const url = await waitReady(getUrl);
+  const token = extractToken((await rawRequest(url)).body);
+  try {
+    const head = await fetch(url, { method: 'HEAD', signal: AbortSignal.timeout(500) });
+    assert.equal(head.status, 200);
+    assert.equal(await head.text(), '');
+  } finally {
+    await fetch(`${url}/cancel`, { method: 'POST', headers: { 'X-Feedback-Token': token } });
+    await result;
+  }
+});
+
+test('浏览器启动器挂起时，配置超时仍能结束调用', async () => {
+  const { result, getUrl } = startDialog({ timeout: 100 }, () => new Promise(() => {}));
+  const url = await waitReady(getUrl);
+  const token = extractToken((await rawRequest(url)).body);
+  const actual = await Promise.race([
+    result,
+    new Promise((resolve) => setTimeout(() => resolve('still waiting'), 500)),
+  ]);
+  if (actual === 'still waiting') {
+    await fetch(`${url}/cancel`, { method: 'POST', headers: { 'X-Feedback-Token': token } });
+    await result;
+  }
+  assert.deepEqual(actual, { submitted: false, timedOut: true });
+});
+
+test('客户端取消会结束活动调用，并通过事件流通知页面', async () => {
+  const controller = new AbortController();
+  const { result, getUrl } = startDialog({ signal: controller.signal });
+  const url = await waitReady(getUrl);
+  const token = extractToken((await rawRequest(url)).body);
+  const events = await fetch(`${url}/events?token=${token}`, { signal: AbortSignal.timeout(1000) });
+  assert.equal(events.headers.get('content-type'), 'text/event-stream');
+  const body = events.text();
+  controller.abort();
+  assert.deepEqual(await result, { submitted: false });
+  assert.match(await body, /"status":"cancelled"/);
 });
